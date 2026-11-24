@@ -65,6 +65,17 @@ class TestLaunchHygiene(unittest.TestCase):
             self.assertIn("Terms of Service", terms.text)
             self.assertIn("Blizzard Entertainment", terms.text)
 
+            # Billing transparency: price, cancel/refund policy and a real contact on every page
+            support = "mailto:hscoach.support@gmail.com"
+            self.assertIn("$9.00 USD per month", terms.text)
+            self.assertIn("Cancellation &amp; Refunds", terms.text)
+            self.assertIn("within 7 days", terms.text)
+            self.assertIn(support, terms.text)
+            self.assertIn(support, priv.text)
+            self.assertNotIn("site operator listed on your deployment", priv.text)
+            self.assertIn(support, dash.text)
+            self.assertIn("$9/month", dash.text)
+
     def test_dashboard_onboarding_links_uploader_and_avoids_overclaims(self) -> None:
         app = create_app(CardDB(), self.store, config=_hosted_cfg())
         with TestClient(app) as client:

@@ -150,7 +150,7 @@ _PRIVACY_HTML = _legal_page_html(
     <h2>3. Cookies &amp; Security</h2>
     <p>HS-Coach uses HttpOnly signed session cookies strictly for authentication and isolated guest storage. No third-party ad trackers are embedded.</p>
     <h2>4. Deletion &amp; Contact</h2>
-    <p>To request account or match history deletion, contact the site operator listed on your deployment or cancel an active subscription anytime via Manage Billing.</p>
+    <p>To request account or match history deletion, or for any privacy question, email <a href="mailto:hscoach.support@gmail.com">hscoach.support@gmail.com</a>. You can cancel an active subscription anytime via Manage Billing.</p>
     """,
 )
 
@@ -166,11 +166,19 @@ _TERMS_HTML = _legal_page_html(
     </ul>
     <h2>2. Plans, Quotas &amp; Subscriptions</h2>
     <ul>
-      <li>Free accounts include monthly coaching limits and server-configured models. Pro subscriptions expand monthly limits and model access via recurring Stripe billing until canceled through the Billing Portal.</li>
+      <li><strong>Free:</strong> 5 coached games per month at no cost.</li>
+      <li><strong>Pro:</strong> $9.00 USD per month for 200 coached games per month and stronger models. Payments are processed by Stripe. Pro renews automatically each month until you cancel.</li>
       <li>Automated abuse, quota circumvention, or excessive traffic is subject to rate limiting or account suspension.</li>
     </ul>
-    <h2>3. Disclaimer</h2>
+    <h2>3. Cancellation &amp; Refunds</h2>
+    <ul>
+      <li>You can cancel anytime from <strong>Manage Billing</strong> on the dashboard. You keep Pro until the end of the period you already paid for, and you will not be charged again.</li>
+      <li>We don't give partial refunds for unused time. If something went wrong (for example a duplicate charge, or you couldn't use Pro because of a problem on our side), email us within 7 days of the charge and we'll make it right, including a full refund where appropriate.</li>
+    </ul>
+    <h2>4. Disclaimer</h2>
     <p>AI-generated coaching reports are provided "as is" for educational analysis without warranty of accuracy or uninterrupted availability.</p>
+    <h2>5. Contact</h2>
+    <p>Questions, billing problems or refund requests: <a href="mailto:hscoach.support@gmail.com">hscoach.support@gmail.com</a>.</p>
     """,
 )
 
@@ -357,7 +365,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="grid-2" style="grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));">
         <div><strong>1. Strip Names Locally</strong><div class="muted">Play Standard Constructed. When the game ends, the Windows uploader removes names and BattleTags before anything leaves your PC.</div></div>
         <div><strong>2. Deterministic Math</strong><div class="muted">Exact Python checks find missed lethals, floated mana, burned cards and unused attacks first, so the AI review is grounded in real numbers.</div></div>
-        <div><strong>3. Grounded AI Review</strong><div class="muted"><strong>Free:</strong> 5 coached games/mo (Flash) + upload token · <strong>Pro:</strong> 200/mo across Gemini Pro, Sonnet, and GPT-4.1.</div></div>
+        <div><strong>3. Grounded AI Review</strong><div class="muted"><strong>Free:</strong> 5 coached games/mo (Flash) + upload token · <strong>Pro:</strong> $9/month for 200/mo across Gemini Pro, Sonnet, and GPT-4.1. Cancel anytime.</div></div>
       </div>
     </section>
 
@@ -941,6 +949,8 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <a href="/privacy" style="color: var(--info);">Privacy Policy</a>
     <span> · </span>
     <a href="/terms" style="color: var(--info);">Terms of Service</a>
+    <span> · </span>
+    <a href="mailto:hscoach.support@gmail.com" style="color: var(--info);">hscoach.support@gmail.com</a>
   </footer>
 </body>
 </html>

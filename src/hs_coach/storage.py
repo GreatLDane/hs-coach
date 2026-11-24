@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -11,7 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from hs_coach.schemas import CoachReport, GameReplay
+from hs_coach.cards import CardDB
+from hs_coach.schemas import CoachReport, DeckReview, GameReplay
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -100,7 +102,117 @@ CREATE TABLE IF NOT EXISTS games (
     completion_trusted INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, game_id)
 );
+
+CREATE TABLE IF NOT EXISTS deck_reviews (
+    user_id TEXT NOT NULL,
+    deck_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    sample_size INTEGER NOT NULL,
+    model TEXT,
+    cost_usd REAL,
+    review_json TEXT NOT NULL,
+    PRIMARY KEY (user_id, deck_key)
+);
 """
+
+# ---- Deck & Pocket-Meta Advisor helpers ----
+
+DECK_MIN_CARDS = 3
+DECK_MIN_GAMES = 5
+DECK_RECENT_GAMES = 20
+_LABEL_BAD_CHARS = re.compile(r"[^A-Za-z0-9 '/-]")
+
+
+def sanitize_label(value: Any) -> str:
+    """LLM/client-derived labels reused in prompts: [A-Za-z0-9 '/-], max 40 chars."""
+    if not isinstance(value, str):
+        return ""
+    return _LABEL_BAD_CHARS.sub("", value).strip()[:40].strip()
+
+
+def _norm_class(value: Any) -> str:
+    cleaned = re.sub(r"[^A-Z_]", "", str(value or "").upper())
+    return cleaned or "UNKNOWN"
+
+
+def _class_title(cls: str) -> str:
+    return cls.replace("_", " ").title()
+
+
+def _json_list(value: Any) -> list[Any]:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+# Pull only the deck-relevant parts of each stored replay inside SQLite (json1), so listing
+# decks never loads whole replays into Python. Avoids the `#-1` path syntax (needs SQLite
+# 3.42+); the production image may ship an older SQLite.
+_DECK_GAME_SELECT = """
+    SELECT game_id, created_at, your_class, opponent_class, result,
+           your_archetype, opponent_archetype,
+           json_extract(replay_json, '$.your_deck_observed') AS deck_json,
+           json_extract(replay_json, '$.mulligan.offered') AS offered_json,
+           json_array_length(replay_json, '$.turns') AS n_turns,
+           CASE WHEN json_array_length(replay_json, '$.turns') > 0 THEN
+               json_extract(
+                   replay_json,
+                   '$.turns[' || (json_array_length(replay_json, '$.turns') - 1) || '].end_state.your_hand'
+               )
+           END AS hand_json,
+           coach_json IS NOT NULL AS coached,
+           CASE WHEN json_valid(coach_json) THEN json_extract(coach_json, '$.habit_tags') END
+               AS habits_json
+    FROM games
+    WHERE user_id = ? AND json_valid(replay_json)
+    ORDER BY created_at ASC, game_id ASC
+"""
+
+
+def _decode_deck_game(row: sqlite3.Row, card_db: CardDB) -> dict[str, Any]:
+    """Extract only the deck-relevant, validated facts from one stored game row."""
+    deck: dict[str, int] = {}
+    for dc in _json_list(row["deck_json"]):
+        cid = dc.get("card_id") if isinstance(dc, dict) else None
+        cnt = dc.get("count") if isinstance(dc, dict) else None
+        if cid not in card_db.by_id or not isinstance(cnt, int) or cnt < 1:
+            continue
+        deck[cid] = max(deck.get(cid, 0), min(cnt, card_db.max_copies(cid)))
+    mull: list[tuple[str, bool]] = []
+    for mc in _json_list(row["offered_json"]):
+        cid = mc.get("card_id") if isinstance(mc, dict) else None
+        if cid in card_db.by_id:
+            mull.append((cid, bool(mc.get("kept"))))
+    n_turns = row["n_turns"] or 0
+    final_hand = sorted(
+        {
+            h.get("card_id")
+            for h in _json_list(row["hand_json"])
+            if isinstance(h, dict) and h.get("card_id") in card_db.by_id
+        }
+    )
+    coach: dict[str, Any] | None = None
+    if row["coached"]:
+        coach = {"habit_tags": _json_list(row["habits_json"])}
+    return {
+        "game_id": row["game_id"],
+        "created_at": row["created_at"],
+        "your_class": _norm_class(row["your_class"]),
+        "opponent_class": _norm_class(row["opponent_class"]),
+        "result": row["result"],
+        "your_archetype": sanitize_label(row["your_archetype"]),
+        "opponent_archetype": sanitize_label(row["opponent_archetype"]),
+        "deck": deck,
+        "cards": frozenset(deck),
+        "mulligan": mull,
+        "final_hand": final_hand,
+        "has_turns": n_turns > 0,
+        "coach": coach,
+    }
 
 
 def _row_to_user(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -1208,3 +1320,228 @@ class GameStore:
                 strength_counts.values(), key=lambda x: (-x["count"], x["tag"])
             ),
         }
+
+
+    # ---- Deck & Pocket-Meta Advisor ----
+
+    def _build_deck_clusters(self, user_id: str, card_db: CardDB) -> list[dict[str, Any]]:
+        """Group a user's games into decks: one deck per class (oldest game first).
+
+        Card-overlap clustering was tried and rejected: each game only reveals 8-16 of the
+        30 cards, so overlap rules split one real deck into many (see checks.md, review).
+        """
+        with self._lock:
+            rows = self._conn.execute(_DECK_GAME_SELECT, (user_id,)).fetchall()
+        by_class: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            g = _decode_deck_game(row, card_db)
+            cls = g["your_class"]
+            cluster = by_class.get(cls)
+            if cluster is None:
+                cluster = {
+                    "deck_key": f"{cls}-main",
+                    "your_class": cls,
+                    "games": [],
+                }
+                by_class[cls] = cluster
+            cluster["games"].append(g)
+        for cluster in by_class.values():
+            recent = cluster["games"][-DECK_RECENT_GAMES:]
+            cluster["unknown"] = len(self._observed_decklist(recent, card_db)) < DECK_MIN_CARDS
+        return list(by_class.values())
+
+    @staticmethod
+    def _cluster_display_name(cluster: dict[str, Any]) -> str:
+        counts: dict[str, int] = {}
+        for g in cluster["games"][-DECK_RECENT_GAMES:]:
+            if g["coach"] is not None and g["your_archetype"]:
+                counts[g["your_archetype"]] = counts.get(g["your_archetype"], 0) + 1
+        if counts:
+            return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+        return _class_title(cluster["your_class"])
+
+    @staticmethod
+    def _observed_decklist(games: list[dict[str, Any]], card_db: CardDB) -> dict[str, int]:
+        """Max observed count per card over the given games (recent window, so old lists fade)."""
+        merged: dict[str, int] = {}
+        for g in games:
+            for cid, cnt in g["deck"].items():
+                merged[cid] = max(merged.get(cid, 0), min(cnt, card_db.max_copies(cid)))
+        return merged
+
+    @staticmethod
+    def _record(games: list[dict[str, Any]]) -> dict[str, Any]:
+        wins = sum(1 for g in games if g["result"] == "win")
+        losses = sum(1 for g in games if g["result"] == "loss")
+        ties = sum(1 for g in games if g["result"] == "tie")
+        total = len(games)
+        return {
+            "games": total,
+            "wins": wins,
+            "losses": losses,
+            "ties": ties,
+            "win_rate": round(wins / total * 100, 1) if total else 0.0,
+        }
+
+    def list_deck_clusters(self, user_id: str, card_db: CardDB) -> list[dict[str, Any]]:
+        """Summaries of the user's decks (newest activity first). Every query filters by user_id."""
+        out: list[dict[str, Any]] = []
+        for cl in self._build_deck_clusters(user_id, card_db):
+            games = cl["games"]
+            recent_games = games[-DECK_RECENT_GAMES:]
+            decklist = self._observed_decklist(recent_games, card_db)
+            n = len(games)
+            eligible = (not cl["unknown"]) and n >= DECK_MIN_GAMES
+            opp_counts: dict[str, int] = {}
+            for g in recent_games:
+                opp_counts[g["opponent_class"]] = opp_counts.get(g["opponent_class"], 0) + 1
+            top_opp = sorted(opp_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+            out.append(
+                {
+                    "deck_key": cl["deck_key"],
+                    "display_name": (
+                        f"{_class_title(cl['your_class'])} (too few cards seen)"
+                        if cl["unknown"]
+                        else self._cluster_display_name(cl)
+                    ),
+                    "your_class": cl["your_class"],
+                    "games": n,
+                    "coached_games": sum(1 for g in games if g["coach"] is not None),
+                    "observed_total": min(30, sum(decklist.values())),
+                    "pocket_meta": {
+                        **self._record(recent_games),
+                        "top_opponent_classes": [
+                            {"opponent_class": c, "games": k} for c, k in top_opp
+                        ],
+                    },
+                    "eligible": eligible,
+                    "games_needed": 0 if eligible else max(0, DECK_MIN_GAMES - n),
+                    "unreviewable": bool(cl["unknown"]),
+                    "latest_review": self.get_deck_review(user_id, cl["deck_key"]),
+                    "_last_game": games[-1]["created_at"],
+                }
+            )
+        out.sort(key=lambda d: (d["_last_game"], d["deck_key"]), reverse=True)
+        for d in out:
+            d.pop("_last_game", None)
+        return out
+
+    def aggregate_deck(
+        self, user_id: str, deck_key: str, card_db: CardDB, *, recent: int = DECK_RECENT_GAMES
+    ) -> dict[str, Any] | None:
+        """Aggregate decklist, pocket meta, per-card signals and habits for one of the user's decks."""
+        cluster = next(
+            (c for c in self._build_deck_clusters(user_id, card_db) if c["deck_key"] == deck_key),
+            None,
+        )
+        if cluster is None:
+            return None
+        games = cluster["games"]
+        window = games[-recent:] if recent > 0 else games
+        decklist = self._observed_decklist(window, card_db)
+
+        opp_classes: dict[str, int] = {}
+        opp_archetypes: dict[str, int] = {}
+        kept: dict[str, int] = {}
+        tossed: dict[str, int] = {}
+        dead: dict[str, int] = {}
+        mistakes: dict[str, int] = {}
+        strengths: dict[str, int] = {}
+        for g in window:
+            opp_classes[g["opponent_class"]] = opp_classes.get(g["opponent_class"], 0) + 1
+            if g["coach"] is not None and g["opponent_archetype"]:
+                a = g["opponent_archetype"]
+                opp_archetypes[a] = opp_archetypes.get(a, 0) + 1
+            for cid, was_kept in g["mulligan"]:
+                bucket = kept if was_kept else tossed
+                bucket[cid] = bucket.get(cid, 0) + 1
+            if g["result"] == "loss" and g["has_turns"]:
+                for cid in g["final_hand"]:
+                    dead[cid] = dead.get(cid, 0) + 1
+            if g["coach"] is not None:
+                for ht in g["coach"].get("habit_tags") or []:
+                    if not isinstance(ht, dict):
+                        continue
+                    tag = sanitize_label(ht.get("tag"))
+                    if not tag:
+                        continue
+                    bucket = strengths if ht.get("polarity") == "strength" else mistakes
+                    bucket[tag] = bucket.get(tag, 0) + 1
+
+        def _top(d: dict[str, int], n: int | None = None) -> list[dict[str, Any]]:
+            items = sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))
+            return [{"name": k, "count": v} for k, v in (items[:n] if n else items)]
+
+        return {
+            "deck_key": deck_key,
+            "your_class": cluster["your_class"],
+            "display_name": self._cluster_display_name(cluster),
+            "unreviewable": bool(cluster["unknown"]),
+            "games": len(games),
+            "coached_games": sum(1 for g in games if g["coach"] is not None),
+            "sample_size": len(window),
+            "decklist": dict(sorted(decklist.items())),
+            "observed_total": min(30, sum(decklist.values())),
+            "pocket_meta": {
+                **self._record(window),
+                "opponent_classes": _top(opp_classes),
+                "opponent_archetypes": _top(opp_archetypes),
+            },
+            "signals": {
+                "mulligan_kept": dict(sorted(kept.items())),
+                "mulligan_tossed": dict(sorted(tossed.items())),
+                "dead_in_hand_losses": dict(sorted(dead.items())),
+            },
+            "habits": {
+                "mistakes": _top(mistakes, 5),
+                "strengths": _top(strengths, 5),
+            },
+        }
+
+    def save_deck_review(self, user_id: str, deck_key: str, review: DeckReview) -> None:
+        created_at = datetime.now(timezone.utc).isoformat()
+        model = review.usage.model if review.usage else None
+        cost = review.usage.estimated_cost_usd if review.usage else None
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO deck_reviews (
+                    user_id, deck_key, created_at, sample_size, model, cost_usd, review_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, deck_key) DO UPDATE SET
+                    created_at = excluded.created_at,
+                    sample_size = excluded.sample_size,
+                    model = excluded.model,
+                    cost_usd = excluded.cost_usd,
+                    review_json = excluded.review_json
+                """,
+                (
+                    user_id,
+                    deck_key,
+                    created_at,
+                    review.sample_size,
+                    model,
+                    cost,
+                    review.model_dump_json(),
+                ),
+            )
+            self._conn.commit()
+
+    def get_deck_review(self, user_id: str, deck_key: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT created_at, sample_size, model, cost_usd, review_json
+                FROM deck_reviews
+                WHERE user_id = ? AND deck_key = ?
+                """,
+                (user_id, deck_key),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            review = json.loads(row["review_json"])
+        except ValueError:
+            return None
+        review["created_at"] = row["created_at"]
+        return review

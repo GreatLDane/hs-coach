@@ -19,6 +19,8 @@ from hs_coach.schemas import (
     BoardStateSnapshot,
     CoachReport,
     CoachReportContent,
+    DeckReview,
+    DeckReviewContent,
     GameReplay,
     TurnSnapshot,
     UsageStats,
@@ -792,4 +794,271 @@ def coach_game(
         **content.model_dump(),
         game_id=replay.metadata.game_id,
         usage=usage,
+    )
+
+
+# ---- Deck & Pocket-Meta Advisor (post-game aggregate review) ----
+
+DECK_SHORTLIST_LIMIT = 120
+DECK_SWITCH_MIN_SAMPLE = 10
+_TECH_MECHANICS = frozenset({"TAUNT", "LIFESTEAL", "RUSH", "FREEZE", "SILENCE", "DISCOVER"})
+_TECH_TEXT_HINTS = ("armor", "destroy", "all enemy minions", "draw")
+
+
+class DeckReviewError(ValueError):
+    """Deck review failed validation after the repair round; carries the usage already spent."""
+
+    def __init__(self, message: str, usage: UsageStats | None = None) -> None:
+        super().__init__(message)
+        self.usage = usage
+
+
+def _tech_relevant(rec: dict[str, Any], text: str) -> bool:
+    if _TECH_MECHANICS & set(rec.get("mechanics") or []):
+        return True
+    low = text.lower()
+    return any(hint in low for hint in _TECH_TEXT_HINTS)
+
+
+def deck_candidate_shortlist(
+    aggregate: dict[str, Any], card_db: CardDB, *, limit: int = DECK_SHORTLIST_LIMIT
+) -> list[dict[str, Any]]:
+    """Deterministic <=120 card shortlist of Standard-legal tech candidates for this deck."""
+    hero = aggregate["your_class"]
+    decklist: dict[str, int] = aggregate.get("decklist", {})
+
+    def _key(rec: dict[str, Any]) -> tuple[Any, ...]:
+        is_class = rec.get("cardClass") == hero or hero in (rec.get("classes") or [])
+        text = card_db.clean_text(rec["id"], strip_alternate=True)
+        cost = rec.get("cost") if isinstance(rec.get("cost"), int) else 99
+        # Tech-relevant cards first (class before neutral), then everything else, so common
+        # neutral tech cards are never pushed out by a large class pool.
+        return (0 if _tech_relevant(rec, text) else 1, 0 if is_class else 1, cost, rec["id"])
+
+    pool = [
+        rec
+        for rec in card_db.standard_pool(hero)
+        if decklist.get(rec["id"], 0) < card_db.max_copies(rec["id"])
+    ]
+    pool.sort(key=_key)
+    return pool[:limit]
+
+
+def _fmt_deck_card(card_db: CardDB, cid: str, *, max_text: int = 100) -> str:
+    rec = card_db.get(cid)
+    cost = rec.get("cost")
+    text = card_db.clean_text(cid, strip_alternate=True)[:max_text]
+    return f"{card_db.name(cid)} ({cost if isinstance(cost, int) else '?'} mana) [{cid}]: {text}"
+
+
+def build_deck_review_prompt(
+    aggregate: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    card_db: CardDB,
+    sample_size: int,
+) -> tuple[str, str]:
+    """Build (system, user) prompts from aggregated finished-game data. CardDB text only."""
+    schema = json.dumps(DeckReviewContent.model_json_schema(), separators=(",", ":"))
+    if sample_size < DECK_SWITCH_MIN_SAMPLE:
+        sample_rule = (
+            f"Sample size is {sample_size} finished games (under {DECK_SWITCH_MIN_SAMPLE}). "
+            "You MUST NOT use overall_verdict 'consider_switching_deck', and switch_advice MUST "
+            "say the sample is still small for a full deck switch."
+        )
+    else:
+        sample_rule = (
+            f"Sample size is {sample_size} finished games, so any overall_verdict is allowed."
+        )
+    system = (
+        "You are a Hearthstone deck advisor reviewing aggregated results of the player's "
+        "FINISHED games with one deck. Everything you are given is post-game data; advise "
+        "only on deck construction for future games.\n"
+        "Rules:\n"
+        "- Use only the data below. Refer to the player as 'you' and to opponents as "
+        "'opponent'. Never mention player names, BattleTags or deck codes.\n"
+        "- Describe the opposing field by archetype family (for example 'faster aggro/tempo', "
+        "'board-control'), not by deck codes.\n"
+        "- State whether the main leak is execution/mulligan, the pocket meta (the matchups "
+        "this player keeps facing), mixed, or unclear (main_leak).\n"
+        "- cut_suggestions (max 2) must use card_id values from the OBSERVED DECKLIST and each "
+        "reason must cite dead-in-hand, mulligan or matchup evidence from the data.\n"
+        "- tech_suggestions (max 2) must use card_id values from the CANDIDATE SHORTLIST only; "
+        "replaces_card_id, when set, must be a card_id from the OBSERVED DECKLIST. Each needs "
+        "1-4 target_matchups (opponent class or archetype family).\n"
+        "- The observed decklist is built from cards seen in games and may be incomplete.\n"
+        f"- {sample_rule}\n"
+        "- Respond with ONLY one JSON object matching this JSON schema:\n"
+        f"{schema}"
+    )
+
+    decklist: dict[str, int] = aggregate["decklist"]
+    sig = aggregate["signals"]
+    pm = aggregate["pocket_meta"]
+    lines: list[str] = [
+        f"# Deck review data ({aggregate['your_class']}, {sample_size} finished games, "
+        f"{aggregate['coached_games']} coached)",
+        f"\n## OBSERVED DECKLIST ({aggregate['observed_total']}/30 cards observed)",
+    ]
+    for cid, cnt in sorted(decklist.items(), key=lambda kv: (card_db.get(kv[0]).get("cost") or 0, kv[0])):
+        lines.append(f"{cnt}x {_fmt_deck_card(card_db, cid)}")
+
+    lines.append("\n## POCKET META (your recent finished games with this deck)")
+    lines.append(
+        f"Record: {pm['wins']}W-{pm['losses']}L-{pm['ties']}T ({pm['win_rate']}% win rate)"
+    )
+    lines.append(
+        "Opponent classes: "
+        + (", ".join(f"{o['name']} x{o['count']}" for o in pm["opponent_classes"]) or "none")
+    )
+    lines.append(
+        "Opponent archetypes (coached games): "
+        + (", ".join(f"{o['name']} x{o['count']}" for o in pm["opponent_archetypes"]) or "none")
+    )
+
+    lines.append("\n## PER-CARD SIGNALS (only cards with a signal)")
+    signal_ids = sorted(
+        set(sig["mulligan_kept"]) | set(sig["mulligan_tossed"]) | set(sig["dead_in_hand_losses"])
+    )
+    for cid in signal_ids:
+        lines.append(
+            f"{card_db.name(cid)} [{cid}]: kept in mulligan {sig['mulligan_kept'].get(cid, 0)}x, "
+            f"tossed {sig['mulligan_tossed'].get(cid, 0)}x, "
+            f"still in hand at the end of {sig['dead_in_hand_losses'].get(cid, 0)} loss(es)"
+        )
+    if not signal_ids:
+        lines.append("none recorded")
+
+    habits = aggregate["habits"]
+    lines.append("\n## HABIT TAGS FROM COACHED GAMES")
+    lines.append(
+        "Mistakes: " + (", ".join(f"{h['name']} x{h['count']}" for h in habits["mistakes"]) or "none")
+    )
+    lines.append(
+        "Strengths: " + (", ".join(f"{h['name']} x{h['count']}" for h in habits["strengths"]) or "none")
+    )
+
+    lines.append(
+        f"\n## CANDIDATE SHORTLIST ({len(candidates)} Standard-legal cards: id | name | cost | class | text)"
+    )
+    for rec in candidates:
+        cid = rec["id"]
+        cost = rec.get("cost")
+        text = card_db.clean_text(cid, strip_alternate=True)[:160]
+        lines.append(
+            f"{cid} | {card_db.name(cid)} | {cost if isinstance(cost, int) else '?'} | "
+            f"{rec.get('cardClass', '')} | {text}"
+        )
+    return system, "\n".join(lines)
+
+
+def _check_deck_review(
+    content: DeckReviewContent,
+    aggregate: dict[str, Any],
+    shortlist_ids: set[str],
+    card_db: CardDB,
+    sample_size: int,
+) -> list[str]:
+    errs: list[str] = []
+    decklist = aggregate["decklist"]
+    hero = aggregate["your_class"]
+    for cut in content.cut_suggestions:
+        if cut.card_id not in decklist:
+            errs.append(f"cut card_id {cut.card_id!r} is not in the observed decklist")
+    for tech in content.tech_suggestions:
+        if tech.card_id not in shortlist_ids:
+            errs.append(f"tech card_id {tech.card_id!r} is not in the candidate shortlist")
+        if not card_db.is_standard_legal(tech.card_id, hero):
+            errs.append(f"tech card_id {tech.card_id!r} is not Standard-legal for {hero}")
+        if tech.replaces_card_id is not None and tech.replaces_card_id not in decklist:
+            errs.append(f"replaces_card_id {tech.replaces_card_id!r} is not in the observed decklist")
+    if sample_size < DECK_SWITCH_MIN_SAMPLE:
+        if content.overall_verdict == "consider_switching_deck":
+            errs.append(
+                f"overall_verdict 'consider_switching_deck' needs {DECK_SWITCH_MIN_SAMPLE}+ games "
+                f"(sample is {sample_size})"
+            )
+        if "small" not in content.switch_advice.lower():
+            errs.append("switch_advice must say the sample is still small for a full deck switch")
+    return errs
+
+
+def review_deck(
+    aggregate: dict[str, Any],
+    config: CoachConfig,
+    card_db: CardDB,
+    *,
+    client: httpx.Client | None = None,
+) -> DeckReview:
+    """Call the LLM once (plus one repair round) and return a validated DeckReview."""
+    sample_size = int(aggregate["sample_size"])
+    candidates = deck_candidate_shortlist(aggregate, card_db)
+    shortlist_ids = {rec["id"] for rec in candidates}
+    sys_p, user_p = build_deck_review_prompt(aggregate, candidates, card_db, sample_size)
+    t0 = time.monotonic()
+
+    def _parse(raw: str) -> DeckReviewContent:
+        parsed = DeckReviewContent.model_validate_json(extract_json_object(raw))
+        errs = _check_deck_review(parsed, aggregate, shortlist_ids, card_db, sample_size)
+        if errs:
+            raise ValueError("; ".join(errs))
+        return parsed
+
+    raw_text, in_tok, out_tok, cached_tok, reported_cost = _call_llm_provider(
+        config, sys_p, user_p, client=client
+    )
+    content: DeckReviewContent | None = None
+    last_err: Exception | None = None
+    try:
+        content = _parse(raw_text)
+    except ValueError as exc:  # includes pydantic ValidationError
+        last_err = exc
+
+    def _usage() -> UsageStats:
+        final_cost = (
+            round(reported_cost, 6)
+            if reported_cost is not None
+            else estimate_cost_usd(config.model, in_tok, out_tok)
+        )
+        return UsageStats(
+            provider=config.provider,
+            model=config.model,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            cached_tokens=cached_tok,
+            estimated_cost_usd=final_cost,
+            latency_seconds=round(time.monotonic() - t0, 2),
+        )
+
+    if content is None:
+        repair_prompt = (
+            f"{user_p}\n\n"
+            f"# Validation Error Repair\n"
+            f"Your previous JSON output failed validation:\n{last_err}\n\n"
+            f"Previous output:\n{raw_text}\n\n"
+            f"Return ONLY corrected valid JSON conforming strictly to the schema and the rules."
+        )
+        raw_text2, in2, out2, cached2, cost2 = _call_llm_provider(
+            config, sys_p, repair_prompt, client=client
+        )
+        in_tok += in2
+        out_tok += out2
+        cached_tok += cached2
+        if reported_cost is not None or cost2 is not None:
+            reported_cost = (reported_cost or 0.0) + (cost2 or 0.0)
+        try:
+            content = _parse(raw_text2)
+        except ValueError as exc:
+            raise DeckReviewError(f"Deck review failed validation: {exc}", _usage()) from exc
+
+    data = content.model_dump()
+    for cut in data["cut_suggestions"]:
+        cut["card_name"] = card_db.name(cut["card_id"])
+    for tech in data["tech_suggestions"]:
+        tech["card_name"] = card_db.name(tech["card_id"])
+    return DeckReview(
+        **data,
+        deck_key=aggregate["deck_key"],
+        your_class=aggregate["your_class"],
+        sample_size=sample_size,
+        usage=_usage(),
     )

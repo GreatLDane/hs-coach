@@ -41,6 +41,8 @@ from hs_coach.schemas import (
 
 HEARTHSTONEJSON_URL = "https://api.hearthstonejson.com/v1/latest/enUS/cards.json"
 
+# Current Standard set codes. MUST be updated at each Standard rotation: it drives the
+# secret pool, the deck advisor's candidate pool and Standard-legality validation.
 STANDARD_SECRET_SETS = frozenset(
     {
         "BE",
@@ -55,6 +57,10 @@ STANDARD_SECRET_SETS = frozenset(
         "CAP",
     }
 )
+
+STANDARD_SETS = STANDARD_SECRET_SETS
+
+_NON_POOL_TYPES = frozenset({"HERO_POWER", "ENCHANTMENT"})
 
 RACE_NAMES: dict[str, str] = {
     "ALL": "All",
@@ -230,6 +236,39 @@ class CardDB:
         if fallback_race and fallback_race in RACE_NAMES:
             return [RACE_NAMES[fallback_race]]
         return []
+
+    def _in_class_pool(
+        self, rec: dict[str, Any], hero_class: str, include_neutral: bool
+    ) -> bool:
+        """Collectible, Standard-set, non-hero-skin card usable by hero_class."""
+        cid = str(rec.get("id", ""))
+        if not rec.get("collectible"):
+            return False
+        if rec.get("set") not in STANDARD_SETS:
+            return False
+        if rec.get("type") in _NON_POOL_TYPES or cid.startswith("HERO_"):
+            return False
+        card_class = rec.get("cardClass")
+        if card_class == hero_class or hero_class in (rec.get("classes") or []):
+            return True
+        return include_neutral and card_class == "NEUTRAL"
+
+    def standard_pool(
+        self, hero_class: str, *, include_neutral: bool = True
+    ) -> list[dict[str, Any]]:
+        """Collectible Standard cards for hero_class (plus neutral), sorted by id."""
+        return [
+            rec
+            for cid, rec in sorted(self.by_id.items())
+            if self._in_class_pool(rec, hero_class, include_neutral)
+        ]
+
+    def is_standard_legal(self, card_id: str | None, hero_class: str) -> bool:
+        rec = self.by_id.get(card_id) if card_id else None
+        return rec is not None and self._in_class_pool(rec, hero_class, True)
+
+    def max_copies(self, card_id: str | None) -> int:
+        return 1 if self.get(card_id).get("rarity") == "LEGENDARY" else 2
 
     def to_reference(self, card_id: str) -> CardReference:
         rec = self.by_id.get(card_id, {})

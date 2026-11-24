@@ -459,3 +459,40 @@ class CoachReport(CoachReportContent):
     schema_version: str = "1.0.0"
     game_id: str
     usage: UsageStats | None = None
+
+
+# ---- Deck & Pocket-Meta Advisor Schemas (post-game aggregate review) ----
+
+
+class DeckCutSuggestion(_StrictModel):
+    card_id: str
+    card_name: str
+    reason: str
+    evidence: list[str] = Field(default_factory=list, max_length=4)
+
+
+class DeckTechSuggestion(_StrictModel):
+    card_id: str
+    card_name: str
+    replaces_card_id: str | None = None
+    target_matchups: list[str] = Field(min_length=1, max_length=4)
+    reason: str
+
+
+class DeckReviewContent(_StrictModel):
+    """Exact JSON schema returned by the LLM deck advisor."""
+
+    overall_verdict: Literal["keep_list", "tech_adjustments", "consider_switching_deck"]
+    executive_summary: str
+    cut_suggestions: list[DeckCutSuggestion] = Field(default_factory=list, max_length=2)
+    tech_suggestions: list[DeckTechSuggestion] = Field(default_factory=list, max_length=2)
+    switch_advice: str
+    main_leak: Literal["execution_or_mulligan", "pocket_meta", "mixed", "unclear"]
+
+
+class DeckReview(DeckReviewContent):
+    schema_version: str = "1.0.0"
+    deck_key: str
+    your_class: str
+    sample_size: int
+    usage: UsageStats | None = None

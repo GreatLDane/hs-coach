@@ -6,6 +6,7 @@ import asyncio
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import tempfile
@@ -17,7 +18,7 @@ from typing import Any
 
 from fastapi import Cookie, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from hs_coach.auth import (
     GUEST_COOKIE_NAME,
@@ -47,7 +48,7 @@ from hs_coach.billing import (
     verify_stripe_signature,
 )
 from hs_coach.cards import CardDB, canonicalize_replay
-from hs_coach.coach import coach_game, resolve_coach_config
+from hs_coach.coach import coach_game, resolve_coach_config, review_deck
 from hs_coach.config import AppConfig, is_loopback_host, load_app_config
 from hs_coach.parser import parse_power_log
 from hs_coach.render import render_html_report
@@ -91,6 +92,46 @@ class PasswordResetConfirm(BaseModel):
 
 class ShareToggleRequest(BaseModel):
     enabled: bool = True
+
+
+class DeckReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    deck_key: str
+    model: str | None = None
+
+
+_DECK_KEY_RE = re.compile(r"^[A-Z_]+-[a-z0-9]{1,10}$")
+_DECK_REVIEW_FAILED_MSG = "Deck review failed validation; no quota was used."
+
+
+def _present_deck_review(review: dict[str, Any], card_db: CardDB) -> dict[str, Any]:
+    """Attach CardDB-sourced name, cost and cleaned text to suggestion cards for display."""
+
+    def _card(cid: str | None) -> dict[str, Any]:
+        rec = card_db.get(cid)
+        cost = rec.get("cost")
+        return {
+            "card_name": card_db.name(cid),
+            "cost": cost if isinstance(cost, int) else None,
+            "text": card_db.clean_text(cid, strip_alternate=True),
+        }
+
+    out = dict(review)
+    out["cut_suggestions"] = [
+        {**c, **_card(c.get("card_id"))} for c in review.get("cut_suggestions", [])
+    ]
+    out["tech_suggestions"] = [
+        {
+            **t,
+            **_card(t.get("card_id")),
+            "replaces_card_name": (
+                card_db.name(t["replaces_card_id"]) if t.get("replaces_card_id") else None
+            ),
+        }
+        for t in review.get("tech_suggestions", [])
+    ]
+    return out
 
 
 def _legal_page_html(title: str, body_html: str) -> str:
@@ -456,6 +497,12 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         <h2>Matchup Winrates &amp; Strengths</h2>
         <div id="matchupsBox" class="muted">Upload games to see matchup stats.</div>
       </div>
+    </section>
+
+    <section class="card" id="deckAdvisorCard" style="display: none;">
+      <h2>Deck &amp; Pocket-Meta Advisor</h2>
+      <div class="muted" style="margin-bottom: 8px;">Based on your finished games only: groups your recent games by class and suggests cuts and techs for the opponents you actually face. Needs at least 5 games with a class. If you play several decks of one class, they're combined.</div>
+      <div id="deckAdvisorBody" class="muted">Loading decks...</div>
     </section>
   </div>
 
@@ -938,9 +985,128 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    const DECK_VERDICTS = {
+      keep_list: "Keep your list",
+      tech_adjustments: "Small tech adjustments",
+      consider_switching_deck: "Consider switching decks",
+    };
+    const DECK_LEAKS = {
+      execution_or_mulligan: "Main leak: execution or mulligans",
+      pocket_meta: "Main leak: the matchups you keep facing",
+      mixed: "Main leak: a mix of execution and matchups",
+      unclear: "Main leak: unclear from this sample",
+    };
+
+    function renderDeckReview(review, container) {
+      const wrap = el("div", null, "deck-review");
+      wrap.style.marginTop = "8px";
+      wrap.appendChild(el("strong", DECK_VERDICTS[review.overall_verdict] || review.overall_verdict));
+      wrap.appendChild(el("div", `${DECK_LEAKS[review.main_leak] || ""} · based on your last ${review.sample_size} finished games with this deck`, "muted"));
+      wrap.appendChild(el("p", review.executive_summary));
+      if (review.cut_suggestions && review.cut_suggestions.length) {
+        wrap.appendChild(el("strong", "Consider cutting"));
+        for (const c of review.cut_suggestions) {
+          const item = el("div", `${c.card_name}: ${c.reason}`);
+          item.style.marginBottom = "6px";
+          wrap.appendChild(item);
+        }
+      }
+      if (review.tech_suggestions && review.tech_suggestions.length) {
+        const hdr = el("strong", "Consider adding");
+        hdr.style.display = "block";
+        hdr.style.marginTop = "8px";
+        wrap.appendChild(hdr);
+        for (const t of review.tech_suggestions) {
+          const item = el("div", null);
+          item.style.marginBottom = "8px";
+          const cost = t.cost !== null && t.cost !== undefined ? `${t.cost} mana` : "? mana";
+          item.appendChild(el("div", `${t.card_name} (${cost})${t.replaces_card_name ? " in place of " + t.replaces_card_name : ""}`));
+          if (t.text) item.appendChild(el("div", t.text, "muted"));
+          item.appendChild(el("div", `Good against: ${(t.target_matchups || []).join(", ")}`, "muted"));
+          item.appendChild(el("div", t.reason));
+          wrap.appendChild(item);
+        }
+      }
+      const adv = el("div", `Stay or switch: ${review.switch_advice}`);
+      adv.style.marginTop = "8px";
+      wrap.appendChild(adv);
+      container.replaceChildren(wrap);
+    }
+
+    async function reviewDeck(deckKey, btn, container) {
+      const prev = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Reviewing...";
+      try {
+        const res = await fetch("/api/decks/review", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ deck_key: deckKey, model: modelSelect.value || null }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Deck review failed.");
+        renderDeckReview(data, container);
+        await refreshAccount();
+      } catch (err) {
+        container.replaceChildren(el("div", err.message || String(err), "status-msg error"));
+      } finally {
+        btn.disabled = false;
+        btn.textContent = prev;
+      }
+    }
+
+    function renderDeckRow(d) {
+      const row = el("div", null);
+      row.style.padding = "10px 0";
+      row.style.borderTop = "1px solid var(--border, #333)";
+      row.appendChild(el("strong", `${d.display_name} · ${d.games} games`));
+      const pm = d.pocket_meta || {};
+      const opp = (pm.top_opponent_classes || []).map((o) => `${o.opponent_class} x${o.games}`).join(", ");
+      row.appendChild(el("div", `Your last ${pm.games || 0} finished games: ${pm.wins || 0}W-${pm.losses || 0}L (${pm.win_rate || 0}%)${opp ? " · mostly vs " + opp : ""} · ${d.observed_total}/30 cards seen`, "muted"));
+      const out = el("div", null);
+      if (d.unreviewable) {
+        row.appendChild(el("div", "Too few cards were seen in these games to identify the deck.", "muted"));
+      } else if (!d.eligible) {
+        row.appendChild(el("div", `${d.games}/5 games to unlock`, "muted"));
+      } else {
+        const btn = el("button", "Review Deck & Techs", "primary");
+        btn.type = "button";
+        btn.style.marginTop = "6px";
+        btn.addEventListener("click", () => reviewDeck(d.deck_key, btn, out));
+        row.appendChild(btn);
+      }
+      row.appendChild(out);
+      if (d.latest_review) renderDeckReview(d.latest_review, out);
+      return row;
+    }
+
+    async function refreshDeckAdvisor() {
+      const card = document.getElementById("deckAdvisorCard");
+      const box = document.getElementById("deckAdvisorBody");
+      if (!card || !box) return;
+      if (!authState.authenticated) {
+        card.style.display = "none";
+        box.replaceChildren();
+        return;
+      }
+      card.style.display = "block";
+      try {
+        const res = await fetch("/api/decks");
+        if (!res.ok) throw new Error("Unable to load your decks.");
+        const decks = await res.json();
+        const nodes = decks.length
+          ? decks.map(renderDeckRow)
+          : [el("div", "Finish and upload some games to see your decks here.", "muted")];
+        box.replaceChildren(...nodes);
+      } catch (err) {
+        box.replaceChildren(el("div", err.message || String(err), "muted"));
+      }
+    }
+
     async function refreshAll() {
       await refreshAccount();
       await refreshDashboard();
+      await refreshDeckAdvisor();
     }
 
     refreshAll();
@@ -1816,6 +1982,69 @@ def create_app(
             request, response, hs_coach_session, hs_coach_guest, allow_create_guest=True
         )
         return app.state.store.get_habit_summary(user_id=actor_id)
+
+    @app.get("/api/decks")
+    def list_decks(
+        request: Request,
+        hs_coach_session: str | None = Cookie(default=None),
+        hs_coach_guest: str | None = Cookie(default=None),
+    ) -> list[dict[str, Any]]:
+        actor_id, user, _plan = _resolve_actor(
+            request, None, hs_coach_session, hs_coach_guest
+        )
+        if cfg.mode == "hosted" and user is None:
+            raise HTTPException(status_code=401, detail="Authentication required.")
+        decks = app.state.store.list_deck_clusters(actor_id, app.state.card_db)
+        for d in decks:
+            if d["latest_review"] is not None:
+                d["latest_review"] = _present_deck_review(
+                    d["latest_review"], app.state.card_db
+                )
+        return decks
+
+    @app.post("/api/decks/review")
+    def review_stored_deck(
+        req: DeckReviewRequest,
+        request: Request,
+        hs_coach_session: str | None = Cookie(default=None),
+        hs_coach_guest: str | None = Cookie(default=None),
+    ) -> Any:
+        _enforce_rate_limit(request, "coach")
+        actor_id, user, plan_name = _resolve_actor(
+            request, None, hs_coach_session, hs_coach_guest
+        )
+        if cfg.mode == "hosted" and (user is None or plan_name != "pro"):
+            raise HTTPException(status_code=403, detail="Deck reviews are a Pro feature.")
+        if not _DECK_KEY_RE.match(req.deck_key):
+            raise HTTPException(status_code=400, detail="Invalid deck_key.")
+        agg = app.state.store.aggregate_deck(
+            actor_id, req.deck_key, app.state.card_db
+        )
+        if agg is None:
+            raise HTTPException(status_code=404, detail="Deck not found")
+        if agg["unreviewable"] or agg["games"] < 5:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Deck reviews need at least 5 games with this deck "
+                    f"(you have {0 if agg['unreviewable'] else agg['games']})."
+                ),
+            )
+        coach_cfg = _validate_policy_and_config(plan_name, req.model, None)
+        res_id = _reserve_for_actor(
+            actor_id, plan_name, f"deck-{req.deck_key}", coach_cfg.model
+        )
+        try:
+            review = review_deck(agg, coach_cfg, app.state.card_db)
+            app.state.store.save_deck_review(actor_id, req.deck_key, review)
+        except Exception as exc:
+            if res_id is not None:
+                app.state.store.release_coaching_reservation(res_id)
+            raise HTTPException(status_code=502, detail=_DECK_REVIEW_FAILED_MSG) from exc
+        if res_id is not None:
+            app.state.store.complete_coaching_reservation(res_id)
+        stored = app.state.store.get_deck_review(actor_id, req.deck_key) or {}
+        return _present_deck_review(stored, app.state.card_db)
 
     @app.get("/games/{game_id}/report", response_class=HTMLResponse)
     def view_report(

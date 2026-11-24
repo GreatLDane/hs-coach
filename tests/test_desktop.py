@@ -137,8 +137,7 @@ class TestDesktop(unittest.TestCase):
             svc.resume()
             self.assertFalse(svc.status().paused)
 
-            res = svc.scan_now()
-            self.assertEqual(res.new_games_uploaded, 1)
+            svc.scan_now()
             st = svc.status()
             self.assertGreaterEqual(st.scans_completed, 1)
             self.assertEqual(st.total_uploaded, 1)

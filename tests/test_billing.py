@@ -236,5 +236,62 @@ class TestBilling(unittest.TestCase):
             self.assertEqual(downgraded.status_code, 403)
 
 
+
+
+class TestStripeErrorMessages(unittest.TestCase):
+    def _cfg(self):
+        from hs_coach.billing import StripeConfig
+
+        return StripeConfig(
+            secret_key="sk_live_dummy",
+            webhook_secret="whsec_dummy",
+            pro_price_id="price_missing",
+            public_url="https://coach.example.com",
+        )
+
+    def _client(self, status: int, body: dict):
+        import httpx
+
+        return httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(status, json=body)))
+
+    def test_checkout_error_surfaces_stripe_message(self) -> None:
+        from hs_coach.billing import StripeRequestError, create_checkout_session
+
+        body = {"error": {"type": "invalid_request_error", "message": "No such price: 'price_missing'"}}
+        with self.assertRaises(StripeRequestError) as ctx:
+            create_checkout_session(self._cfg(), user_id="u1", email="a@b.c", client=self._client(400, body))
+        self.assertIn("HTTP 400", str(ctx.exception))
+        self.assertIn("No such price: 'price_missing'", str(ctx.exception))
+
+    def test_error_message_masks_secrets(self) -> None:
+        from hs_coach.billing import StripeRequestError, create_billing_portal_session
+
+        body = {"error": {"message": "Invalid API Key provided: sk_live_abc123XYZ and whsec_zzz"}}
+        with self.assertRaises(StripeRequestError) as ctx:
+            create_billing_portal_session(self._cfg(), customer_id="cus_1", client=self._client(401, body))
+        msg = str(ctx.exception)
+        self.assertNotIn("sk_live_abc123XYZ", msg)
+        self.assertNotIn("whsec_zzz", msg)
+        self.assertIn("[redacted]", msg)
+
+    def test_non_json_error_still_reports_status(self) -> None:
+        import httpx
+
+        from hs_coach.billing import StripeRequestError, create_checkout_session
+
+        client = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(500, text="oops")))
+        with self.assertRaises(StripeRequestError) as ctx:
+            create_checkout_session(self._cfg(), user_id="u1", email="a@b.c", client=client)
+        self.assertIn("HTTP 500", str(ctx.exception))
+
+    def test_success_response_passes_through(self) -> None:
+        from hs_coach.billing import create_checkout_session
+
+        out = create_checkout_session(
+            self._cfg(), user_id="u1", email="a@b.c", client=self._client(200, {"url": "https://checkout.stripe.com/x"})
+        )
+        self.assertEqual(out["url"], "https://checkout.stripe.com/x")
+
+
 if __name__ == "__main__":
     unittest.main()

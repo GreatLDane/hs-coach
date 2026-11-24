@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +20,27 @@ STRIPE_API_BASE = "https://api.stripe.com/v1"
 
 class TransientStripeError(RuntimeError):
     """Raised when a transient Stripe API/network error occurs and webhook should retry."""
+
+
+class StripeRequestError(RuntimeError):
+    """Raised when Stripe rejects a request; carries Stripe's own error message."""
+
+
+_SECRET_PATTERN = re.compile(r"\b(?:sk|rk|whsec)_[A-Za-z0-9_]+")
+
+
+def _raise_for_stripe(resp: httpx.Response) -> None:
+    """Raise StripeRequestError with Stripe's error message (secrets masked) on a non-2xx response."""
+    if not resp.is_error:
+        return
+    message = ""
+    try:
+        err = resp.json().get("error") or {}
+        message = str(err.get("message") or err.get("code") or "")
+    except Exception:
+        message = ""
+    message = _SECRET_PATTERN.sub("[redacted]", message)[:300] or "no message returned"
+    raise StripeRequestError(f"HTTP {resp.status_code}: {message}")
 
 
 @dataclass(frozen=True)
@@ -78,7 +100,7 @@ def create_checkout_session(
             headers={"Authorization": f"Bearer {cfg.secret_key}"},
             data=form,
         )
-        resp.raise_for_status()
+        _raise_for_stripe(resp)
         return dict(resp.json())
     finally:
         if owns_client:
@@ -105,7 +127,7 @@ def create_billing_portal_session(
                 "return_url": f"{cfg.public_url}/",
             },
         )
-        resp.raise_for_status()
+        _raise_for_stripe(resp)
         return dict(resp.json())
     finally:
         if owns_client:

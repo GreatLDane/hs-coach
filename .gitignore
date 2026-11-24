@@ -1,0 +1,33 @@
+# Logs (never commit Hearthstone logs)
+*.log
+Power*.log
+
+# Secrets & API keys
+.env
+.env.*
+*secret*
+*api_key*
+*.key
+
+# Local card data & generated outputs
+data/
+local_output/
+reports/
+*.replay.json
+*.coach.json
+*.report.html
+*.replay.html
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+*.spec
+dist/
+build/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/

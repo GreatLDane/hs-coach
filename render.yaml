@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: hs-coach
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/health
+    disk:
+      name: hs-coach-data
+      mountPath: /app/data
+      sizeGB: 2
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: HS_COACH_CARDS_JSON
+        value: "/app/data/cards.json"
+      - key: HS_COACH_MODE
+        value: "hosted"
+      - key: HS_COACH_TRUSTED_PROXIES
+        value: "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7"
+      - key: HS_COACH_COOKIE_SECURE
+        value: "1"
+      - key: HS_COACH_SESSION_SECRET
+        generateValue: true
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: HS_COACH_PUBLIC_URL
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRO_PRICE_ID
+        sync: false

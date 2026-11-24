@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.env.*
+*.log
+Power*.log
+data/
+local_output/
+reports/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+tests/

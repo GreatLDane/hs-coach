@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hs-coach"
+version = "0.1.0"
+description = "100% Post-Game AI Coach for Hearthstone (Standard Constructed)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.10.0",
+    "httpx>=0.28.1",
+    "jinja2>=3.1.6",
+    "fastapi>=0.120.0",
+    "starlette>=0.49.1",
+    "uvicorn>=0.34.0",
+    "python-multipart>=0.0.22",
+    "h11>=0.16.0",
+]
+
+[project.scripts]
+hs-coach = "hs_coach.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,31 @@
+services:
+  hs-coach:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - hs_coach_data:/app/data
+    environment:
+      PORT: "8000"
+      HS_COACH_CARDS_JSON: /app/data/cards.json
+      HS_COACH_MODE: "${HS_COACH_MODE:-hosted}"
+      HS_COACH_TRUSTED_PROXIES: "${HS_COACH_TRUSTED_PROXIES:-127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7}"
+      HS_COACH_COOKIE_SECURE: "${HS_COACH_COOKIE_SECURE:-0}"
+      HS_COACH_ALLOW_HOSTED_GUESTS: "${HS_COACH_ALLOW_HOSTED_GUESTS:-0}"
+      HS_COACH_PROVIDER: "${HS_COACH_PROVIDER:-}"
+      HS_COACH_MODEL: "${HS_COACH_MODEL:-}"
+      HS_COACH_API_KEY: "${HS_COACH_API_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      HS_COACH_SESSION_SECRET: "${HS_COACH_SESSION_SECRET:-}"
+      HS_COACH_UPLOAD_TOKEN: "${HS_COACH_UPLOAD_TOKEN:-}"
+      HS_COACH_PUBLIC_URL: "${HS_COACH_PUBLIC_URL:-http://localhost:8000}"
+      STRIPE_SECRET_KEY: "${STRIPE_SECRET_KEY:-}"
+      STRIPE_WEBHOOK_SECRET: "${STRIPE_WEBHOOK_SECRET:-}"
+      STRIPE_PRO_PRICE_ID: "${STRIPE_PRO_PRICE_ID:-}"
+    restart: unless-stopped
+
+volumes:
+  hs_coach_data:

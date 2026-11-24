@@ -1,0 +1,57 @@
+name: Release Windows Uploader
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-uploader:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install locked dependencies and PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+          pip install --no-deps .
+          pip install pyinstaller pillow
+
+      - name: Build HS-Coach-Uploader.exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          $env:PYTHONPATH = "src"
+          python -c "import os; os.makedirs('build', exist_ok=True); from hs_coach.desktop import create_tray_icon_image; create_tray_icon_image(64).save('build/hs_coach.ico', format='ICO', sizes=[(64, 64), (32, 32), (16, 16)])"
+          pyinstaller --noconfirm --clean --onefile --windowed --paths src --icon build/hs_coach.ico --name HS-Coach-Uploader src/hs_coach/tray_entry.py
+          $code = (Start-Process -FilePath ".\dist\HS-Coach-Uploader.exe" -ArgumentList "--version" -Wait -PassThru).ExitCode
+          if ($code -ne 0) { throw "HS-Coach-Uploader.exe --version exited with $code" }
+          $hash = (Get-FileHash -Algorithm SHA256 ".\dist\HS-Coach-Uploader.exe").Hash.ToLower()
+          "$hash  HS-Coach-Uploader.exe" | Out-File -FilePath ".\dist\HS-Coach-Uploader.exe.sha256" -Encoding ascii
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: HS-Coach-Uploader-Windows
+          path: |
+            dist/HS-Coach-Uploader.exe
+            dist/HS-Coach-Uploader.exe.sha256
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/HS-Coach-Uploader.exe
+            dist/HS-Coach-Uploader.exe.sha256

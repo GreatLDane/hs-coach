@@ -22,6 +22,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.lock
           pip install --no-deps .
+          pip install pillow
 
       - name: Check dependency tree
         run: pip check

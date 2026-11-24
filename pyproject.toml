@@ -17,6 +17,7 @@ dependencies = [
     "uvicorn>=0.34.0",
     "python-multipart>=0.0.22",
     "h11>=0.16.0",
+    "certifi>=2026.10.18",
 ]
 
 [project.scripts]

@@ -273,6 +273,8 @@ class TestProductionReadiness(unittest.TestCase):
                     self.assertIn("const pollUrl = data.poll_url;", home_html)
                     self.assertIn("await fetch(pollUrl)", home_html)
                     self.assertNotIn("fetch(data.poll_url)", home_html)
+                    self.assertIn('id="copyTokenBtn"', home_html)
+                    self.assertIn("Copy Upload Token", home_html)
 
                     release_evt.set()
 

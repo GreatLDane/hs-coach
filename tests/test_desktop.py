@@ -248,6 +248,52 @@ class TestDesktop(unittest.TestCase):
         # Disabling again when already absent stays idempotent
         self.assertFalse(set_windows_startup_enabled(False, _winreg=fake_wr))
 
+    def test_update_config_resets_cache_only_on_server_change(self) -> None:
+        state_path = self.root / "uploader_state.json"
+        watcher = PowerLogWatcher(
+            self.root / "Logs",
+            _test_db(),
+            "http://127.0.0.1:8000",
+            state_path,
+            token="hsc_old",
+        )
+        watcher.state.mark_uploaded("game_1")
+        watcher._file_fingerprints[self.root / "Logs" / "Power.log"] = (123, 456)
+        svc = BackgroundWatcherService(watcher)
+
+        # Updating only upload_token preserves uploaded_game_ids but clears file fingerprints
+        token_only_cfg = DesktopConfig(
+            logs_dir=str(self.root / "Logs"),
+            server_url="http://127.0.0.1:8000",
+            upload_token="hsc_new",
+            state_path=str(state_path),
+        )
+        self.assertFalse(svc.update_config(token_only_cfg))
+        self.assertEqual(watcher.token, "hsc_new")
+        self.assertEqual(watcher.state.uploaded_game_ids, {"game_1"})
+        self.assertEqual(watcher._file_fingerprints, {})
+
+        # Changing server_url resets uploaded_game_ids (in memory & on disk) and file fingerprints
+        watcher._file_fingerprints[self.root / "Logs" / "Power.log"] = (123, 456)
+        new_server_cfg = DesktopConfig(
+            logs_dir=str(self.root / "Logs"),
+            server_url="https://hs-coach.onrender.com",
+            upload_token="hsc_new",
+            state_path=str(state_path),
+        )
+        self.assertTrue(svc.update_config(new_server_cfg))
+        self.assertEqual(watcher.server_url, "https://hs-coach.onrender.com")
+        self.assertEqual(watcher.state.uploaded_game_ids, set())
+        self.assertEqual(watcher._file_fingerprints, {})
+
+        reloaded = PowerLogWatcher(
+            self.root / "Logs",
+            _test_db(),
+            "https://hs-coach.onrender.com",
+            state_path,
+        )
+        self.assertEqual(reloaded.state.uploaded_game_ids, set())
+
 
 if __name__ == "__main__":
     unittest.main()

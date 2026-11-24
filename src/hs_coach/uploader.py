@@ -75,6 +75,11 @@ class UploaderState:
         self.uploaded_game_ids.add(game_id)
         self.save()
 
+    def reset(self) -> None:
+        """Clear all recorded uploaded game IDs and persist the empty state."""
+        self.uploaded_game_ids.clear()
+        self.save()
+
 
 def find_power_logs(logs_dir: str | Path, *, max_files: int = 3) -> list[Path]:
     """Return newest Hearthstone Power.log path(s) from a file, session dir, or Logs root."""
@@ -133,6 +138,36 @@ class PowerLogWatcher:
         self.max_files = max_files
         self._client = client
         self._file_fingerprints: dict[Path, tuple[int, int]] = {}
+
+    def update_target(
+        self,
+        *,
+        server_url: str | None = None,
+        logs_dir: str | Path | None = None,
+        token: str | None = None,
+    ) -> bool:
+        """Update watcher target settings and reset cached uploads if server_url changes.
+
+        Returns True when a Server URL change cleared the uploaded-games cache.
+        """
+        server_changed = False
+        changed_any = False
+        if server_url is not None:
+            new_url = validate_server_url(server_url)
+            server_changed = new_url != self.server_url
+            self.server_url = new_url
+            changed_any = True
+        if logs_dir is not None:
+            self.logs_dir = Path(logs_dir)
+            changed_any = True
+        if token is not None:
+            self.token = token.strip() or None
+            changed_any = True
+        if changed_any:
+            self._file_fingerprints.clear()
+        if server_changed:
+            self.state.reset()
+        return server_changed
 
     def scan_once(self) -> UploadScanResult:
         """Scan changed Power.log files once and upload newly completed Standard games."""

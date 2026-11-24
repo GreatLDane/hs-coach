@@ -287,6 +287,15 @@ class BackgroundWatcherService:
             self._status.paused = False
         self._wake_event.set()
 
+    def update_config(self, cfg: DesktopConfig) -> bool:
+        """Apply updated desktop settings safely, returning True if upload cache was reset."""
+        with self._scan_lock:
+            return self.watcher.update_target(
+                server_url=cfg.server_url,
+                logs_dir=cfg.logs_dir,
+                token=cfg.upload_token,
+            )
+
     def scan_now(self) -> UploadScanResult:
         with self._scan_lock:
             res = self.watcher.scan_once()
@@ -483,10 +492,12 @@ def _run_tkinter_window(cfg_path: Path, cfg: DesktopConfig, service: BackgroundW
         cfg.logs_dir = logs_var.get().strip() or cfg.logs_dir
         cfg.upload_token = token_var.get().strip()
         save_desktop_config(cfg_path, cfg)
-        service.watcher.server_url = cfg.server_url
-        service.watcher.logs_dir = Path(cfg.logs_dir)
-        service.watcher.token = cfg.upload_token or None
-        status_var.set("Settings saved.")
+        cache_reset = service.update_config(cfg)
+        status_var.set(
+            "Settings saved (server changed — upload cache reset)."
+            if cache_reset
+            else "Settings saved."
+        )
 
     def _scan_now() -> None:
         _apply_settings()

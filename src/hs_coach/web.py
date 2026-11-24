@@ -360,6 +360,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
       <div id="watcherBox" class="muted" style="margin-top: 10px; display: none;">
         Auto-uploader command: <code id="watchCmd"></code>
+        <button id="copyTokenBtn" type="button" class="primary" style="margin-left: 8px; padding: 4px 9px; font-size: 0.8rem;">Copy Upload Token</button>
         <button id="rotateTokenBtn" type="button" style="margin-left: 8px; padding: 4px 9px; font-size: 0.8rem;">Rotate Token</button>
       </div>
       <div id="authStatus" class="status-msg" style="margin-top: 6px;"></div>
@@ -455,6 +456,8 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 
     let rawUploadEnabled = true;
     let authState = { authenticated: false, guests_enabled: false };
+    let currentUploadToken = "";
+    const copyTokenBtn = document.getElementById("copyTokenBtn");
 
     async function refreshAccount() {
       const res = await fetch("/api/auth/me");
@@ -536,13 +539,15 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         ctrl.appendChild(logoutBtn);
 
         watcherBox.style.display = "block";
-        watchCmd.textContent = `hs-coach watch --server ${window.location.origin} --token ${u.upload_token}`;
+        currentUploadToken = u.upload_token || "";
+        watchCmd.textContent = `hs-coach watch --server ${window.location.origin} --token ${currentUploadToken}`;
       } else {
         info.textContent = data.mode === "hosted"
           ? (data.guests_enabled
               ? "Isolated Guest Session — Sign in or register for personal quota & auto-uploader token."
               : "Sign in or register free to upload anonymized replays and view coaching history.")
           : "Local Loopback Mode — Register free or sign in for personal history & watcher token.";
+        currentUploadToken = "";
         watcherBox.style.display = "none";
       }
     }
@@ -568,6 +573,15 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 
     document.getElementById("loginBtn")?.addEventListener("click", () => submitAuth("/api/auth/login"));
     document.getElementById("registerBtn")?.addEventListener("click", () => submitAuth("/api/auth/register"));
+    copyTokenBtn?.addEventListener("click", async () => {
+      if (!currentUploadToken) return;
+      try {
+        await navigator.clipboard.writeText(currentUploadToken);
+        setAuthStatus("Upload token copied! Paste it into HS-Coach-Uploader.exe.");
+      } catch (_err) {
+        window.prompt("Copy your Upload Token:", currentUploadToken);
+      }
+    });
     document.getElementById("rotateTokenBtn")?.addEventListener("click", async () => {
       const res = await fetch("/api/auth/rotate-token", { method: "POST" });
       if (res.ok) {

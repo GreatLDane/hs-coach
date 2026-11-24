@@ -145,6 +145,7 @@ class TestSharing(unittest.TestCase):
                 json={"email": "owner@example.com", "password": "password123"},
             )
             self.assertEqual(r1.status_code, 200)
+            owner_uid = r1.json()["user"]["user_id"]
             self.assertEqual(
                 other_user.post(
                     "/api/auth/register",
@@ -153,12 +154,11 @@ class TestSharing(unittest.TestCase):
                 200,
             )
 
-            up = owner.post(
-                "/api/replays",
-                content=_sample_replay("share_g1").model_dump_json(),
-                headers={"Content-Type": "application/json"},
+            self.store.upsert_replay(
+                _sample_replay("share_g1"),
+                user_id=owner_uid,
+                completion_trusted=True,
             )
-            self.assertEqual(up.status_code, 200)
 
             with mock.patch("hs_coach.web.coach_game", return_value=_sample_report("share_g1")):
                 cr = owner.post("/api/games/share_g1/coach", json={})

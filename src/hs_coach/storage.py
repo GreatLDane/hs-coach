@@ -58,6 +58,14 @@ CREATE TABLE IF NOT EXISTS stripe_events (
     processed_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS stripe_subscriptions (
+    subscription_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    updated_ts INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS password_resets (
     token_hash TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -89,6 +97,7 @@ CREATE TABLE IF NOT EXISTS games (
     model TEXT,
     cost_usd REAL,
     share_token TEXT,
+    completion_trusted INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, game_id)
 );
 """
@@ -155,6 +164,10 @@ class GameStore:
             self._conn.execute("ALTER TABLE games ADD COLUMN coached_at TEXT")
         if "share_token" not in cols:
             self._conn.execute("ALTER TABLE games ADD COLUMN share_token TEXT")
+        if "completion_trusted" not in cols:
+            self._conn.execute(
+                "ALTER TABLE games ADD COLUMN completion_trusted INTEGER NOT NULL DEFAULT 0"
+            )
         self._conn.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_games_share_token
@@ -442,6 +455,178 @@ class GameStore:
                 raise KeyError(f"Unknown user_id: {user_id}")
             self._conn.commit()
 
+    def is_stripe_event_processed(self, event_id: str) -> bool:
+        """Return True if event_id has already been permanently processed."""
+        if not event_id:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM stripe_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+        return row is not None
+
+    def get_stripe_subscription_state(self, subscription_id: str) -> dict[str, Any] | None:
+        """Return persisted status/metadata for a Stripe subscription_id, or None."""
+        if not subscription_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT subscription_id, user_id, status, updated_ts, updated_at
+                FROM stripe_subscriptions
+                WHERE subscription_id = ?
+                """,
+                (subscription_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "subscription_id": row["subscription_id"],
+            "user_id": row["user_id"],
+            "status": row["status"],
+            "updated_ts": int(row["updated_ts"] or 0),
+            "updated_at": row["updated_at"],
+        }
+
+    def apply_stripe_event_entitlement(
+        self,
+        *,
+        event_id: str,
+        event_type: str,
+        created_ts: int,
+        user_id: str,
+        plan: str,
+        stripe_customer_id: str | None = None,
+        stripe_subscription_id: str | None = None,
+        sub_record_id: str | None = None,
+        sub_status: str | None = None,
+    ) -> str:
+        """Atomically reconcile user entitlement, subscription state, and stripe_events.
+
+        Returns one of: 'applied', 'duplicate', 'stale', 'already_canceled'.
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        ts_val = max(0, int(created_ts))
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if event_id:
+                    seen = self._conn.execute(
+                        "SELECT 1 FROM stripe_events WHERE event_id = ?",
+                        (event_id,),
+                    ).fetchone()
+                    if seen is not None:
+                        self._conn.rollback()
+                        return "duplicate"
+
+                user_row = self._conn.execute(
+                    "SELECT stripe_last_event_ts FROM users WHERE user_id = ?",
+                    (user_id,),
+                ).fetchone()
+                if user_row is None:
+                    self._conn.rollback()
+                    raise KeyError(f"Unknown user_id: {user_id}")
+
+                existing_ts = int(user_row["stripe_last_event_ts"] or 0)
+                if ts_val > 0 and ts_val < existing_ts:
+                    if event_id:
+                        self._conn.execute(
+                            """
+                            INSERT OR IGNORE INTO stripe_events (event_id, event_type, created_ts, processed_at)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (event_id, event_type, ts_val, now_iso),
+                        )
+                        self._conn.commit()
+                    else:
+                        self._conn.rollback()
+                    return "stale"
+
+                if plan == "pro" and sub_record_id:
+                    sub_row = self._conn.execute(
+                        "SELECT status FROM stripe_subscriptions WHERE subscription_id = ?",
+                        (sub_record_id,),
+                    ).fetchone()
+                    if sub_row is not None and str(sub_row["status"]).lower() == "canceled":
+                        if event_id:
+                            self._conn.execute(
+                                """
+                                INSERT OR IGNORE INTO stripe_events (event_id, event_type, created_ts, processed_at)
+                                VALUES (?, ?, ?, ?)
+                                """,
+                                (event_id, event_type, ts_val, now_iso),
+                            )
+                            self._conn.commit()
+                        else:
+                            self._conn.rollback()
+                        return "already_canceled"
+
+                if ts_val > 0:
+                    self._conn.execute(
+                        """
+                        UPDATE users
+                        SET plan = ?,
+                            stripe_customer_id = COALESCE(?, stripe_customer_id),
+                            stripe_subscription_id = ?,
+                            stripe_last_event_ts = MAX(COALESCE(stripe_last_event_ts, 0), ?)
+                        WHERE user_id = ?
+                        """,
+                        (
+                            plan,
+                            stripe_customer_id,
+                            stripe_subscription_id,
+                            ts_val,
+                            user_id,
+                        ),
+                    )
+                else:
+                    self._conn.execute(
+                        """
+                        UPDATE users
+                        SET plan = ?,
+                            stripe_customer_id = COALESCE(?, stripe_customer_id),
+                            stripe_subscription_id = ?
+                        WHERE user_id = ?
+                        """,
+                        (plan, stripe_customer_id, stripe_subscription_id, user_id),
+                    )
+
+                if sub_record_id and sub_status:
+                    self._conn.execute(
+                        """
+                        INSERT INTO stripe_subscriptions (
+                            subscription_id, user_id, status, updated_ts, updated_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(subscription_id) DO UPDATE SET
+                            user_id = excluded.user_id,
+                            status = CASE
+                                WHEN stripe_subscriptions.status = 'canceled' THEN 'canceled'
+                                WHEN excluded.updated_ts > 0 AND excluded.updated_ts < stripe_subscriptions.updated_ts
+                                    THEN stripe_subscriptions.status
+                                ELSE excluded.status
+                            END,
+                            updated_ts = MAX(stripe_subscriptions.updated_ts, excluded.updated_ts),
+                            updated_at = excluded.updated_at
+                        """,
+                        (sub_record_id, user_id, sub_status, ts_val, now_iso),
+                    )
+
+                if event_id:
+                    self._conn.execute(
+                        """
+                        INSERT OR IGNORE INTO stripe_events (event_id, event_type, created_ts, processed_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (event_id, event_type, ts_val, now_iso),
+                    )
+
+                self._conn.commit()
+                return "applied"
+            except Exception:
+                self._conn.rollback()
+                raise
+
     def record_stripe_event(
         self, event_id: str, event_type: str, created_ts: int
     ) -> bool:
@@ -616,12 +801,19 @@ class GameStore:
 
     # ---- Games & Coaching ----
 
-    def upsert_replay(self, replay: GameReplay, *, user_id: str = "local") -> bool:
+    def upsert_replay(
+        self,
+        replay: GameReplay,
+        *,
+        user_id: str = "local",
+        completion_trusted: bool = False,
+    ) -> bool:
         """Insert a new replay or update replay fields without clobbering existing coaching."""
         m = replay.metadata
         ps = replay.pre_check_summary
         now_iso = datetime.now(timezone.utc).isoformat()
         replay_json = replay.model_dump_json()
+        trusted_flag = 1 if completion_trusted else 0
 
         with self._lock:
             cur = self._conn.execute(
@@ -643,7 +835,8 @@ class GameStore:
                         total_mana_floated = ?,
                         burned_count = ?,
                         discarded_count = ?,
-                        replay_json = ?
+                        replay_json = ?,
+                        completion_trusted = ?
                     WHERE user_id = ? AND game_id = ?
                     """,
                     (
@@ -658,6 +851,7 @@ class GameStore:
                         len(ps.your_cards_burned),
                         len(ps.your_cards_discarded),
                         replay_json,
+                        trusted_flag,
                         user_id,
                         m.game_id,
                     ),
@@ -668,8 +862,9 @@ class GameStore:
                     INSERT INTO games (
                         user_id, game_id, created_at, your_class, opponent_class, result,
                         end_reason, total_turns, went_first, missed_lethal_count,
-                        total_mana_floated, burned_count, discarded_count, replay_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        total_mana_floated, burned_count, discarded_count, replay_json,
+                        completion_trusted
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         user_id,
@@ -686,10 +881,22 @@ class GameStore:
                         len(ps.your_cards_burned),
                         len(ps.your_cards_discarded),
                         replay_json,
+                        trusted_flag,
                     ),
                 )
             self._conn.commit()
             return not exists
+
+    def is_completion_trusted(
+        self, game_id: str, *, user_id: str = "local"
+    ) -> bool:
+        """Return True if stored game came from a trusted post-game completion path."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT completion_trusted FROM games WHERE user_id = ? AND game_id = ?",
+                (user_id, game_id),
+            ).fetchone()
+        return bool(row and row["completion_trusted"])
 
     def save_coach_report(
         self, game_id: str, report: CoachReport, *, user_id: str = "local"
@@ -734,7 +941,7 @@ class GameStore:
                        end_reason, total_turns, went_first, missed_lethal_count,
                        total_mana_floated, burned_count, discarded_count,
                        overall_grade, your_archetype, opponent_archetype, model, cost_usd,
-                       share_token,
+                       share_token, completion_trusted,
                        CASE WHEN coach_json IS NOT NULL THEN 1 ELSE 0 END AS coached
                 FROM games
                 WHERE user_id = ?
@@ -763,6 +970,7 @@ class GameStore:
                 "cost_usd": r["cost_usd"],
                 "share_token": r["share_token"],
                 "shared": bool(r["share_token"]),
+                "completion_trusted": bool(r["completion_trusted"]),
                 "coached": bool(r["coached"]),
             }
             for r in rows

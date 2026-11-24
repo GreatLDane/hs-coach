@@ -459,7 +459,14 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       return node;
     }
 
+    function formatHabitTag(tag) {
+      const parts = String(tag || "").trim().split(/[\\s_-]+/).filter(Boolean);
+      if (!parts.length) return String(tag || "");
+      return parts.map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(" ");
+    }
+
     let rawUploadEnabled = true;
+    let allowHostedClientCoaching = false;
     let authState = { authenticated: false, guests_enabled: false };
     let currentUploadToken = "";
     const copyTokenBtn = document.getElementById("copyTokenBtn");
@@ -468,6 +475,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       const res = await fetch("/api/auth/me");
       const data = await res.json();
       rawUploadEnabled = Boolean(data.raw_upload_enabled);
+      allowHostedClientCoaching = Boolean(data.allow_hosted_client_coaching);
       authState = { authenticated: Boolean(data.authenticated), guests_enabled: Boolean(data.guests_enabled) };
 
       const uploadHeading = document.getElementById("uploadHeading");
@@ -748,7 +756,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
           const tdAct = document.createElement("td");
           tdAct.style.display = "flex";
           tdAct.style.gap = "8px";
-          const untrustedHosted = !rawUploadEnabled && g.completion_trusted === false;
+          const untrustedHosted = !rawUploadEnabled && !allowHostedClientCoaching && g.completion_trusted === false;
           const btnLabel = g.coached ? "Re-Coach" : (untrustedHosted ? "Unverified" : "Coach");
           const btn = el("button", btnLabel, (g.coached || untrustedHosted) ? "" : "primary");
           btn.type = "button";
@@ -811,7 +819,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       mistakesBox.innerHTML = "";
       if (habits.top_mistakes.length) {
         for (const m of habits.top_mistakes) {
-          const row = el("div", `${m.tag} (x${m.count}) — ${m.latest_note}`);
+          const row = el("div", `${formatHabitTag(m.tag)} (x${m.count}) — ${m.latest_note}`);
           row.style.marginBottom = "8px";
           mistakesBox.appendChild(row);
         }
@@ -1303,6 +1311,7 @@ def create_app(
                 "mode": cfg.mode,
                 "raw_upload_enabled": cfg.allow_raw_log_upload,
                 "guests_enabled": cfg.allow_hosted_guests,
+                "allow_hosted_client_coaching": cfg.allow_hosted_client_coaching,
             }
         return {
             "authenticated": True,
@@ -1311,6 +1320,7 @@ def create_app(
             "mode": cfg.mode,
             "raw_upload_enabled": cfg.allow_raw_log_upload,
             "guests_enabled": cfg.allow_hosted_guests,
+            "allow_hosted_client_coaching": cfg.allow_hosted_client_coaching,
         }
 
     @app.post("/api/auth/rotate-token")
@@ -1472,8 +1482,12 @@ def create_app(
         coach_error: str | None = None
 
         if auto_coach and not coached:
-            if cfg.mode == "hosted" and not app.state.store.is_completion_trusted(
-                gid, user_id=target_user_id
+            if (
+                cfg.mode == "hosted"
+                and not cfg.allow_hosted_client_coaching
+                and not app.state.store.is_completion_trusted(
+                    gid, user_id=target_user_id
+                )
             ):
                 coach_error = _HOSTED_UNTRUSTED_COACH_MSG
             else:
@@ -1629,8 +1643,10 @@ def create_app(
         if loaded is None:
             raise HTTPException(status_code=404, detail="Game not found")
         replay, _ = loaded
-        if cfg.mode == "hosted" and not app.state.store.is_completion_trusted(
-            game_id, user_id=actor_id
+        if (
+            cfg.mode == "hosted"
+            and not cfg.allow_hosted_client_coaching
+            and not app.state.store.is_completion_trusted(game_id, user_id=actor_id)
         ):
             raise HTTPException(status_code=403, detail=_HOSTED_UNTRUSTED_COACH_MSG)
 

@@ -105,8 +105,16 @@ class TestLaunchHygiene(unittest.TestCase):
             self.assertEqual(len(sent_emails), 1)
             to_addr, reset_url = sent_emails[0]
             self.assertEqual(to_addr, "player@example.com")
-            self.assertTrue(reset_url.startswith("https://coach.example.com/?reset_token="))
-            raw_token = parse_qs(urlparse(reset_url).query)["reset_token"][0]
+            self.assertTrue(reset_url.startswith("https://coach.example.com/#reset_token="))
+            parsed_reset = urlparse(reset_url)
+            self.assertEqual(parsed_reset.query, "")
+            raw_token = parse_qs(parsed_reset.fragment)["reset_token"][0]
+
+            # Dashboard HTML must read & clear URL fragment, never search/query params
+            home_html = client.get("/").text
+            self.assertIn("window.location.hash", home_html)
+            self.assertIn("history.replaceState", home_html)
+            self.assertNotIn("URLSearchParams(window.location.search)", home_html)
 
             # 4. Invalid token and short password fail cleanly with 400
             self.assertEqual(

@@ -33,6 +33,7 @@ from hs_coach.schemas import (
     MatchPreCheckSummary,
     MulliganCard,
     MulliganSnapshot,
+    TurnAction,
     TurnPreChecks,
     TurnSnapshot,
     WeaponState,
@@ -338,6 +339,90 @@ class TestCoachAndRender(unittest.TestCase):
         html = render_html_report(rep, None)
         self.assertIn("Observed Decklists", html)
         self.assertIn("(4) Fireball x2", html)
+
+    def test_polish_prompts_glossary_non_mana_actions_and_habit_tags(self) -> None:
+        rep = _dummy_replay()
+        rep.turns[0].actions = [
+            TurnAction(
+                seq=1,
+                actor="you",
+                action_type="PLAY",
+                source_card_id="CS2_029",
+                source_name="Fireball",
+                mana_cost=4,
+                summary="Plays Fireball",
+            ),
+            TurnAction(
+                seq=2,
+                actor="you",
+                action_type="ATTACK",
+                source_card_id="CS2_120",
+                source_name="River Crocolisk",
+                mana_cost=2,  # Legacy replay non-mana cost must still not display
+                summary="Attacks with River Crocolisk",
+            ),
+            TurnAction(
+                seq=3,
+                actor="you",
+                action_type="ACTIVATE",
+                source_card_id="LOC_001",
+                source_name="Cosmic Springs",
+                mana_cost=2,
+                summary="Activates Cosmic Springs",
+            ),
+        ]
+        rep.cards_seen["HERO_08"] = CardReference(
+            card_id="HERO_08", name="Jaina Proudmoore", card_type="HERO", text=""
+        )
+        rep.cards_seen["DET_1"] = CardReference(
+            card_id="DET_1",
+            name="Detected!",
+            card_type="SPELL",
+            base_cost=0,
+            text="This was played on the friendly side.",
+        )
+        rep.cards_seen["ENCH_1"] = CardReference(
+            card_id="ENCH_1",
+            name="Extra Steel",
+            card_type="ENCHANTMENT",
+            text="+2 Armor",
+        )
+        rep.cards_seen["CS2_029"].text = "Battlecry:& Deal d6 damage."
+
+        sys_p, user_p = build_coaching_prompt(rep)
+        # New prompt guardrails
+        self.assertIn("[Stealth]", sys_p)
+        self.assertIn("[Elusive]", sys_p)
+        self.assertIn("Evaluate high-impact `Choices`", sys_p)
+        self.assertIn("game-ending", sys_p)
+        # Prompt omits non-mana cost tags & separates/filters internal glossary entries
+        self.assertIn("1. Plays Fireball (4m)", user_p)
+        self.assertIn("2. Attacks with River Crocolisk\n", user_p)
+        self.assertNotIn("River Crocolisk (2m)", user_p)
+        self.assertNotIn("Cosmic Springs (2m)", user_p)
+        self.assertNotIn("Detected!", user_p)
+        self.assertNotIn("Extra Steel", user_p)
+        self.assertNotIn("[HERO_08]", user_p)
+        self.assertIn("Battlecry: Deal 6 damage.", user_p)
+
+        report_payload = _valid_coach_payload()
+        report_payload["turning_points"][0]["habit_tag"] = "threat_assessment"
+        report_payload["habit_tags"][0]["tag"] = "resource_management"
+        from hs_coach.schemas import CoachReport
+
+        report = CoachReport(**report_payload, game_id=rep.metadata.game_id)
+        html = render_html_report(rep, report)
+        self.assertIn("Threat Assessment", html)
+        self.assertIn("Resource Management", html)
+        self.assertNotIn("threat_assessment", html)
+        self.assertNotIn("resource_management", html)
+        self.assertIn("Card Glossary (1 playable cards seen in match)", html)
+        self.assertIn("Enchantments &amp; Effects (1)", html)
+        self.assertNotIn("Detected!", html)
+        self.assertNotIn("<code>HERO_08</code>", html)
+        self.assertIn("Plays Fireball <span style=\"color: var(--muted);\">(4m)</span>", html)
+        self.assertNotIn("Attacks with River Crocolisk <span", html)
+        self.assertNotIn("Activates Cosmic Springs <span", html)
 
 
 if __name__ == "__main__":

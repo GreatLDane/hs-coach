@@ -13,6 +13,7 @@ from typing import Any, Literal
 import httpx
 from pydantic import ValidationError
 
+from hs_coach.cards import CardDB, canonicalize_replay, clean_hs_display_text, partition_glossary
 from hs_coach.schemas import (
     BoardEntitySnapshot,
     BoardStateSnapshot,
@@ -395,7 +396,11 @@ def _fmt_turn(t: TurnSnapshot) -> str:
     if t.actions:
         out.append("Actions (in order):")
         for act in t.actions:
-            cost_s = f" ({act.mana_cost}m)" if act.mana_cost is not None else ""
+            cost_s = (
+                f" ({act.mana_cost}m)"
+                if act.action_type in ("PLAY", "HERO_POWER") and act.mana_cost is not None
+                else ""
+            )
             out.append(f"  {act.seq}. {act.summary}{cost_s}")
     else:
         out.append("Actions: (none)")
@@ -438,24 +443,38 @@ def _fmt_turn(t: TurnSnapshot) -> str:
     return "\n".join(out)
 
 
-def build_coaching_prompt(replay: GameReplay) -> tuple[str, str]:
+def build_coaching_prompt(
+    replay: GameReplay,
+    *,
+    card_db: CardDB | None = None,
+) -> tuple[str, str]:
     """Build grounded (system_prompt, user_prompt) for post-game coaching."""
+    if card_db is not None:
+        replay = canonicalize_replay(replay, card_db)
     schema_json = json.dumps(CoachReportContent.model_json_schema(), indent=2)
     system_prompt = (
         "You are an expert Hearthstone Standard Constructed post-game AI coach.\n"
         "Strict grounding rules:\n"
         "1. Rely ONLY on the provided Match Metadata, Card Glossary, Turn Snapshots, and Python Pre-Checks.\n"
         "2. NEVER invent card text, mana costs, stats, or cards that were not observed in the replay.\n"
-        "3. Respect Hearthstone legality markers in the state snapshots: NEVER suggest attacking with a "
-        "`[CANNOT ATTACK THIS TURN]` minion, NEVER suggest bypassing `[TAUNT ACTIVE]` (attacks must hit "
-        "Taunt minions first), and ALWAYS verify what survived or died against `End State` (not guesses).\n"
+        "3. Respect Hearthstone legality and targeting markers in the state snapshots: NEVER suggest attacking "
+        "with a `[CANNOT ATTACK THIS TURN]` minion, NEVER suggest bypassing `[TAUNT ACTIVE]` (attacks must hit "
+        "Taunt minions first), NEVER suggest targeting `[Stealth]` minions with attacks, spells, or Hero Power, "
+        "NEVER suggest targeting `[Elusive]` minions with targeted spells or Hero Power (only attacks or untargeted "
+        "AoE can hit `[Elusive]`), and ALWAYS verify what survived or died against `End State` (not guesses).\n"
         "4. Respect deterministic Python pre-checks (`MISSED_LETHAL`, `mana_floated`, `cards_burned`, "
         "`unused_attacks`, `unused_ready_locations`), while checking context such as active enemy Secrets, "
         "Divine Shield, or lethal setups before judging a play a mistake.\n"
         "5. Evaluate EVERY card offered to 'you' in the Mulligan individually.\n"
-        "6. Identify up to 3 highest-impact Turning Points ranked 1..3 using severity in "
-        "['Missed Lethal', 'Blunder', 'Inaccuracy']. Name exact cards, mana, and lines.\n"
-        "7. Output ONLY a single valid JSON object conforming strictly to the JSON Schema below — no markdown "
+        "6. Evaluate high-impact `Choices` (`offered [...] -> picked [...]`, including Discover spells, Dark Gift, "
+        "and weapon/minion options) when another offered option clearly addressed the board state—such as Divine Shield, "
+        "Taunt, or lethal—better than the pick taken.\n"
+        "7. Identify up to 3 highest-impact Turning Points ranked 1..3 using severity in "
+        "['Missed Lethal', 'Blunder', 'Inaccuracy']. Name exact cards, mana, and lines. Format every habit tag in "
+        "concise Title Case (e.g., `Mana Efficiency`, `Threat Assessment`).\n"
+        "8. Stay strictly consistent with the match result in `# Match Metadata`: NEVER describe a mid-game play "
+        "as 'game-ending', 'game-winning', or 'sealing the win' when the match result is LOSS or TIE.\n"
+        "9. Output ONLY a single valid JSON object conforming strictly to the JSON Schema below — no markdown "
         "fences or extra prose.\n\n"
         f"JSON Schema:\n{schema_json}"
     )
@@ -505,8 +524,9 @@ def build_coaching_prompt(replay: GameReplay) -> tuple[str, str]:
         f"- Turns with unused ready locations: {ps.turns_with_unused_ready_locations or 'None'}"
     )
 
-    glossary_lines = ["# Card Glossary (Exact Cards Seen In This Match)"]
-    for ref in sorted(replay.cards_seen.values(), key=lambda r: (r.name, r.card_id)):
+    playable_glossary, _ = partition_glossary(replay.cards_seen)
+    glossary_lines = ["# Card Glossary (Playable Cards Seen In This Match)"]
+    for ref in playable_glossary:
         cost_s = f"({ref.base_cost}) " if ref.base_cost is not None else ""
         stats_s = (
             f" {ref.base_attack}/{ref.base_health}"
@@ -516,9 +536,10 @@ def build_coaching_prompt(replay: GameReplay) -> tuple[str, str]:
         meta_bits = [b for b in (ref.card_type, ref.spell_school, "/".join(ref.races)) if b]
         meta_s = f" [{' | '.join(meta_bits)}]" if meta_bits else ""
         pos_s = " <POSITION MATTERS>" if ref.position_matters else ""
+        cleaned_ref_txt = clean_hs_display_text(ref.text) if ref.text else ""
         glossary_lines.append(
             f"- {cost_s}{ref.name}{stats_s}{meta_s}{pos_s} [{ref.card_id}]: "
-            f"{ref.text or '(no text)'}"
+            f"{cleaned_ref_txt or '(no text)'}"
         )
     sections.append("\n".join(glossary_lines))
 
@@ -687,10 +708,13 @@ def _call_llm_provider(
 
 
 def dry_run_summary(
-    replay: GameReplay, *, model: str | None = None
+    replay: GameReplay,
+    *,
+    model: str | None = None,
+    card_db: CardDB | None = None,
 ) -> dict[str, Any]:
     """Build prompts and report token/cost estimates without calling any LLM API."""
-    sys_p, user_p = build_coaching_prompt(replay)
+    sys_p, user_p = build_coaching_prompt(replay, card_db=card_db)
     in_tok = estimate_tokens(sys_p) + estimate_tokens(user_p)
     est_out = 1200
     cost_table: dict[str, float | None] = {}
@@ -713,10 +737,11 @@ def coach_game(
     config: CoachConfig,
     *,
     client: httpx.Client | None = None,
+    card_db: CardDB | None = None,
 ) -> CoachReport:
     """Call the configured LLM provider and return a strictly validated CoachReport."""
     validate_completed_replay(replay)
-    sys_p, user_p = build_coaching_prompt(replay)
+    sys_p, user_p = build_coaching_prompt(replay, card_db=card_db)
     t0 = time.monotonic()
 
     raw_text, in_tok, out_tok, cached_tok, reported_cost = _call_llm_provider(

@@ -21,6 +21,7 @@ ActionType = Literal[
     "PREPARE",
     "ABILITY",
     "DECK_ACTION",
+    "TRIGGER",
 ]
 
 

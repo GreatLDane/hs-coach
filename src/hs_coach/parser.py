@@ -8,7 +8,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, TextIO
 
-from hs_coach.cards import HERALD_NAME, CardDB, clean_card_text
+from hs_coach.cards import (
+    HERALD_NAME,
+    CardDB,
+    clean_card_text,
+    format_action_summary,
+    is_internal_card_reference,
+)
 from hs_coach.schemas import (
     ActionType,
     BoardEntitySnapshot,
@@ -401,6 +407,7 @@ class _ActiveBlock:
     atk_card_type: str | None = None
     atk_target_type: str | None = None
     triggered_secrets: set[str] = field(default_factory=set)
+    trigger_key: tuple[int, str] | None = None
 
 
 @dataclass
@@ -473,6 +480,7 @@ class _GameSimulator:
         self.pending_atk: tuple[_TurnWork, int] | None = None
         self.pending_abil: tuple[_TurnWork, int, str] | None = None
         self.pending_da: tuple[_TurnWork, int, int] | None = None
+        self._action_meta: dict[tuple[int, int], tuple[str | None, bool]] = {}
 
         # Turn lifecycle
         self.player_turn_counts: dict[Side, int] = {"you": 0, "opponent": 0}
@@ -626,11 +634,12 @@ class _GameSimulator:
         raw = self.db.raw_text(cid).split("@", 1)[0]
         if not raw:
             return ""
-        t = clean_card_text(raw, strip_alternate=False)
+        t = clean_card_text(raw, strip_alternate=False, replace_placeholders=False)
         if ent is not None and "TAG_SCRIPT_DATA_NUM_1" in ent["tags"]:
             t = LEFT_RE.sub(rf"({ent['tags']['TAG_SCRIPT_DATA_NUM_1']}\1)", t)
         t = self._fill_placeholders(t, cid, ent=ent, ctrl=ctrl)
         t = re.sub(r"\(\{\d\}[^)]*\)", "", t)
+        t = re.sub(r"\{\d+\}", "X", t)
         return re.sub(r"\s+", " ", t).strip()
 
     def _assembled(self, ent: dict[str, Any]) -> tuple[str, str] | None:
@@ -854,14 +863,17 @@ class _GameSimulator:
             t = re.sub(r"\$(\d+)", lambda m: str(n1 + sp), raw, count=1)
         else:
             t = re.sub(r"\$(\d+)", lambda m: str(int(m.group(1)) + sp), raw)
-        t = clean_card_text(t, strip_alternate=False)
+        t = clean_card_text(t, strip_alternate=False, replace_placeholders=False)
         t = self._fill_placeholders(t, cid, ent=ent, ctrl=ent["tags"].get("CONTROLLER"))
-        return t, sp, cd_state
+        return re.sub(r"\{\d+\}", "X", t), sp, cd_state
 
     def _hp_text(self, ent: dict[str, Any]) -> str:
         cid = ent.get("card", "")
         t = self._fill_placeholders(
-            self.db.clean_text(cid), cid, ent=ent, ctrl=ent["tags"].get("CONTROLLER")
+            self.db.clean_text(cid, replace_placeholders=False),
+            cid,
+            ent=ent,
+            ctrl=ent["tags"].get("CONTROLLER"),
         )
         n1 = _int_tag(ent, "TAG_SCRIPT_DATA_NUM_1")
         if n1 > 0:
@@ -871,7 +883,7 @@ class _GameSimulator:
                 t = t.replace("@", str(n1))
             elif re.search(r"\bDeal \d+ damage\b", t):
                 t = re.sub(r"\bDeal \d+ damage\b", f"Deal {n1} damage", t, count=1)
-        return t
+        return re.sub(r"\{\d+\}", "X", t)
 
     def _quest_info(self, ent: dict[str, Any]) -> tuple[int | None, int | None, str | None]:
         prog = _int_tag(ent, "QUEST_PROGRESS")
@@ -1095,7 +1107,10 @@ class _GameSimulator:
                 and _int_tag(ent, "ATK") > 0
                 and _int_tag(ent, "NUM_ATTACKS_THIS_TURN") < limit
             ):
-                kws.append("Rush (minions only this turn)")
+                if "Rush" in kws:
+                    kws[kws.index("Rush")] = "Rush (minions only)"
+                else:
+                    kws.append("Rush (minions only)")
 
             if dormant and wake_turn is not None:
                 kws.append(f"Dormant (wakes T{wake_turn}, now T{now_turn})")
@@ -1771,25 +1786,22 @@ class _GameSimulator:
         src_name: str,
         tgt_name: str | None,
         tgt_side: Side | None,
+        *,
+        actor: Side | None = None,
+        active_player: Side | None = None,
+        cause: str | None = None,
+        is_spell_trigger: bool = False,
     ) -> str:
-        tgt_disp = tgt_name
-        if tgt_disp and tgt_side and "Hero" not in tgt_disp and tgt_name:
-            tgt_disp = f"{tgt_name} ({tgt_side})"
-        if action_type == "HERO_POWER":
-            return f"Hero Power: {src_name}" + (f" -> {tgt_disp}" if tgt_disp else "")
-        if action_type == "ACTIVATE":
-            return f"Activates {src_name}" + (f" -> {tgt_disp}" if tgt_disp else "")
-        if action_type == "TRADE":
-            return f"Trades {src_name}"
-        if action_type == "PREPARE":
-            return f"Prepares {src_name}"
-        if action_type == "DECK_ACTION":
-            return f"Deck action: {src_name}"
-        if action_type == "ABILITY":
-            return f"Uses {src_name}" + (f" -> {tgt_disp}" if tgt_disp else "")
-        if action_type == "ATTACK":
-            return f"Attacks with {src_name}" + (f" -> {tgt_disp}" if tgt_disp else "")
-        return f"Plays {src_name}" + (f" -> {tgt_disp}" if tgt_disp else "")
+        return format_action_summary(
+            action_type,
+            src_name,
+            tgt_name,
+            tgt_side,
+            actor=actor,
+            active_player=active_player,
+            cause=cause,
+            is_spell_trigger=is_spell_trigger,
+        )
 
     def _unknown_label(self, ent: dict[str, Any]) -> str:
         if ent["tags"].get("ZONE") == "SECRET" or _int_tag(ent, "SECRET") == 1:
@@ -1812,8 +1824,13 @@ class _GameSimulator:
                 act.source_name = self._unknown_label(se)
             if act.action_type == "PLAY" and se["tags"].get("CARDTYPE") == "HERO_POWER":
                 act.action_type = "HERO_POWER"
-            if act.mana_cost is None and "COST" in se["tags"]:
-                act.mana_cost = _int_tag(se, "COST")
+            if act.action_type in ("PLAY", "HERO_POWER"):
+                if act.mana_cost is None and "COST" in se["tags"]:
+                    act.mana_cost = _int_tag(se, "COST")
+            else:
+                act.mana_cost = None
+        if act.action_type not in ("PLAY", "HERO_POWER"):
+            act.mana_cost = None
         if act.target_entity_id is not None and act.target_entity_id in self.ents:
             te = self.ents[act.target_entity_id]
             tcid = te.get("card") or act.target_card_id
@@ -1824,8 +1841,18 @@ class _GameSimulator:
             tctrl = te["tags"].get("CONTROLLER")
             if tctrl:
                 act.target_side = self._side_of(tctrl)
+        cause, is_spell_trigger = self._action_meta.get(
+            (tw.turn_number, action_idx), (None, False)
+        )
         act.summary = self._format_action_summary(
-            act.action_type, act.source_name, act.target_name, act.target_side
+            act.action_type,
+            act.source_name,
+            act.target_name,
+            act.target_side,
+            actor=act.actor,
+            active_player=tw.active_player,
+            cause=cause,
+            is_spell_trigger=is_spell_trigger,
         )
 
     def _set_entity_tag(self, eid: int, tag: str, val: str) -> None:
@@ -2405,11 +2432,19 @@ class _GameSimulator:
                             source_entity_id=src_eid,
                             source_card_id=scid,
                             source_name=sname,
-                            mana_cost=mana_cost,
-                            summary=self._format_action_summary(action_type, sname, None, None),
+                            mana_cost=None,
+                            summary=self._format_action_summary(
+                                action_type,
+                                sname,
+                                None,
+                                None,
+                                actor=side,
+                                active_player=tw.active_player,
+                            ),
                         )
                     )
                     blk.action_idx = len(tw.actions) - 1
+                    self._action_meta[(tw.turn_number, blk.action_idx)] = (None, False)
                     self.pending_da = (tw, blk.action_idx, src_eid)
                 elif (
                     bt == "PLAY"
@@ -2443,14 +2478,23 @@ class _GameSimulator:
                             target_card_id=tcid,
                             target_name=tname,
                             target_side=tside,
-                            mana_cost=0,
-                            summary=self._format_action_summary("ABILITY", g_name, tname, tside),
+                            mana_cost=None,
+                            summary=self._format_action_summary(
+                                "ABILITY",
+                                g_name,
+                                tname,
+                                tside,
+                                actor=side,
+                                active_player=tw.active_player,
+                            ),
                         )
                     )
                     blk.action_idx = len(tw.actions) - 1
+                    self._action_meta[(tw.turn_number, blk.action_idx)] = (None, False)
                     if scid:
                         self.pending_abil = (tw, blk.action_idx, scid)
                 else:
+                    cause: str | None = None
                     if bt == "PLAY":
                         if se["tags"].get("CARDTYPE") == "HERO_POWER":
                             action_type = "HERO_POWER"
@@ -2472,6 +2516,10 @@ class _GameSimulator:
                             )
                     else:
                         action_type = "ATTACK"
+                        if any(b.block_type == "DEATHS" for b in self.block_stack):
+                            cause = "Deathrattle"
+                        elif any(b.block_type == "TRIGGER" for b in self.block_stack):
+                            cause = "Triggered"
                         if ctrl == self.me:
                             blk.atk_card_type = se["tags"].get("CARDTYPE")
                             blk.atk_target_type = (
@@ -2491,13 +2539,126 @@ class _GameSimulator:
                             target_card_id=tcid,
                             target_name=tname,
                             target_side=tside,
-                            mana_cost=mana_cost,
-                            summary=self._format_action_summary(action_type, sname, tname, tside),
+                            mana_cost=(
+                                mana_cost
+                                if action_type in ("PLAY", "HERO_POWER")
+                                else None
+                            ),
+                            summary=self._format_action_summary(
+                                action_type,
+                                sname,
+                                tname,
+                                tside,
+                                actor=side,
+                                active_player=tw.active_player,
+                                cause=cause,
+                            ),
                         )
                     )
                     blk.action_idx = len(tw.actions) - 1
+                    self._action_meta[(tw.turn_number, blk.action_idx)] = (cause, False)
                     if action_type == "ATTACK" and tgt_eid is None:
                         self.pending_atk = (tw, blk.action_idx)
+            elif (
+                bt == "TRIGGER"
+                and src_eid is not None
+                and self.current_turn_work is not None
+                and self.game_tags.get("STEP") not in (None, "", "BEGIN_MULLIGAN")
+            ):
+                se = self._ent(src_eid)
+                scid = se.get("card") or ""
+                if scid:
+                    ctype = (
+                        se["tags"].get("CARDTYPE")
+                        or str(self.db.get(scid).get("type", ""))
+                    ).upper()
+                    sname = self.db.name(scid)
+                    step = self.game_tags.get("STEP", "")
+                    is_relevant_trigger = (
+                        ctype in ("SPELL", "WEAPON")
+                        or (
+                            ctype == "ENCHANTMENT"
+                            and (
+                                "aura" in sname.lower()
+                                or "TriggerKeyword=END_OF_TURN" in s
+                                or "TriggerKeyword=START_OF_TURN" in s
+                                or step == "MAIN_END"
+                            )
+                        )
+                    )
+                    already_playing_same = any(
+                        b.block_type == "PLAY" and b.source_eid == src_eid
+                        for b in self.block_stack
+                    )
+                    trig_key = (src_eid, scid)
+                    enclosing_dup = any(
+                        b.trigger_key == trig_key for b in self.block_stack
+                    )
+                    tw = self.current_turn_work
+                    last_act = tw.actions[-1] if tw.actions else None
+                    consecutive_dup = (
+                        last_act is not None
+                        and last_act.action_type == "TRIGGER"
+                        and last_act.source_entity_id == src_eid
+                        and last_act.source_card_id == scid
+                    )
+                    if (
+                        is_relevant_trigger
+                        and ctype not in ("", "GAME", "PLAYER", "HERO", "HERO_POWER")
+                        and not is_internal_card_reference(self.db.to_reference(scid))
+                        and not already_playing_same
+                        and not enclosing_dup
+                        and not consecutive_dup
+                    ):
+                        self.seen_card_ids.add(scid)
+                        ctrl = se["tags"].get("CONTROLLER")
+                        side = self._side_of(ctrl)
+                        tcid = (
+                            self._ent(tgt_eid).get("card") or None
+                            if tgt_eid is not None
+                            else None
+                        )
+                        if tcid:
+                            self.seen_card_ids.add(tcid)
+                        tname = self.db.name(tcid) if tcid else None
+                        tside = (
+                            self._side_of(self._ent(tgt_eid)["tags"].get("CONTROLLER"))
+                            if tgt_eid is not None
+                            else None
+                        )
+                        trig_cause = "Trigger" if side != tw.active_player else None
+                        is_spell_trig = ctype == "SPELL"
+                        tw.actions.append(
+                            TurnAction(
+                                seq=len(tw.actions) + 1,
+                                actor=side,
+                                action_type="TRIGGER",
+                                source_entity_id=src_eid,
+                                source_card_id=scid,
+                                source_name=sname,
+                                target_entity_id=tgt_eid,
+                                target_card_id=tcid,
+                                target_name=tname,
+                                target_side=tside,
+                                mana_cost=None,
+                                summary=self._format_action_summary(
+                                    "TRIGGER",
+                                    sname,
+                                    tname,
+                                    tside,
+                                    actor=side,
+                                    active_player=tw.active_player,
+                                    cause=trig_cause,
+                                    is_spell_trigger=is_spell_trig,
+                                ),
+                            )
+                        )
+                        blk.action_idx = len(tw.actions) - 1
+                        blk.trigger_key = trig_key
+                        self._action_meta[(tw.turn_number, blk.action_idx)] = (
+                            trig_cause,
+                            is_spell_trig,
+                        )
 
             self.block_stack.append(blk)
             return

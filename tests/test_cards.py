@@ -8,7 +8,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from hs_coach.cards import CardDB, clean_card_text
+from hs_coach.cards import CardDB, clean_card_text, partition_glossary
+from hs_coach.schemas import CardReference
 
 
 class TestCards(unittest.TestCase):
@@ -99,6 +100,42 @@ class TestCards(unittest.TestCase):
             "When your opponent casts a spell",
             self.db.secret_pool_by_class["MAGE"]["Counterspell"],
         )
+
+    def test_markup_stripping_and_glossary_partitioning(self) -> None:
+        raw_amp = "<b>Battlecry and Deathrattle:</b>& Draw a card. Gain d2 Armor. Deal {0} damage."
+        self.assertEqual(
+            clean_card_text(raw_amp),
+            "Battlecry and Deathrattle: Draw a card. Gain 2 Armor. Deal X damage.",
+        )
+        self.assertEqual(
+            clean_card_text("Deal {0} damage.", replace_placeholders=False),
+            "Deal {0} damage.",
+        )
+
+        cards_seen = {
+            "HERO_01": CardReference(card_id="HERO_01", name="Garrosh Hellscream", card_type="HERO", text=""),
+            "DET_1": CardReference(
+                card_id="DET_1",
+                name="Detected!",
+                card_type="SPELL",
+                base_cost=0,
+                text="This was played on the friendly side.",
+            ),
+            "DG_INT": CardReference(
+                card_id="DG_INT",
+                name="Dark Gift",
+                card_type="SPELL",
+                text="Executes nightmare bonus",
+            ),
+            "ONY_1": CardReference(card_id="ONY_1", name="Onyxia's Wing", card_type="MINION", base_cost=1, text="Rush"),
+            "ONY_1t": CardReference(card_id="ONY_1t", name="Onyxia's Wing", card_type="MINION", base_cost=1, text="Rush"),
+            "ENCH_1": CardReference(card_id="ENCH_1", name="Black Scales", card_type="ENCHANTMENT", text="+2 Attack"),
+            "SPELL_1": CardReference(card_id="SPELL_1", name="Shield Block", card_type="SPELL", base_cost=3, text="Gain d5 Armor."),
+        }
+        playable, enchantments = partition_glossary(cards_seen)
+        self.assertEqual([c.name for c in playable], ["Onyxia's Wing", "Shield Block"])
+        self.assertEqual([c.card_id for c in playable], ["ONY_1", "SPELL_1"])
+        self.assertEqual([e.name for e in enchantments], ["Black Scales"])
 
 
 if __name__ == "__main__":

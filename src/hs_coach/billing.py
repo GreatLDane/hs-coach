@@ -17,6 +17,10 @@ from hs_coach.storage import GameStore
 STRIPE_API_BASE = "https://api.stripe.com/v1"
 
 
+class TransientStripeError(RuntimeError):
+    """Raised when a transient Stripe API/network error occurs and webhook should retry."""
+
+
 @dataclass(frozen=True)
 class StripeConfig:
     secret_key: str
@@ -120,12 +124,24 @@ def fetch_stripe_subscription(
     owns_client = client is None
     http = client or httpx.Client(timeout=30.0)
     try:
-        resp = http.get(
-            f"{STRIPE_API_BASE}/subscriptions/{subscription_id}",
-            headers={"Authorization": f"Bearer {cfg.secret_key}"},
-        )
-        resp.raise_for_status()
-        return dict(resp.json())
+        try:
+            resp = http.get(
+                f"{STRIPE_API_BASE}/subscriptions/{subscription_id}",
+                headers={"Authorization": f"Bearer {cfg.secret_key}"},
+            )
+            resp.raise_for_status()
+            return dict(resp.json())
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 429 or status >= 500:
+                raise TransientStripeError(
+                    f"Temporary Stripe HTTP {status} looking up {subscription_id}"
+                ) from exc
+            raise
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.TransportError) as exc:
+            raise TransientStripeError(
+                f"Temporary Stripe transport error looking up {subscription_id}: {exc}"
+            ) from exc
     finally:
         if owns_client:
             http.close()
@@ -220,7 +236,7 @@ def handle_stripe_event(
     except (TypeError, ValueError):
         created_ts = 0
 
-    if event_id and not store.record_stripe_event(event_id, etype, created_ts):
+    if event_id and store.is_stripe_event_processed(event_id):
         return {
             "handled": False,
             "duplicate": True,
@@ -228,57 +244,106 @@ def handle_stripe_event(
             "reason": "duplicate_event",
         }
 
+    def _record_permanent(reason: str) -> dict[str, Any]:
+        if event_id and not store.record_stripe_event(event_id, etype, created_ts):
+            return {
+                "handled": False,
+                "duplicate": True,
+                "event_type": etype,
+                "reason": "duplicate_event",
+            }
+        return {"handled": False, "event_type": etype, "reason": reason}
+
     obj = (event.get("data") or {}).get("object") or {}
     pro_price_id = config.pro_price_id if config else ""
 
     if etype == "checkout.session.completed":
         if str(obj.get("mode", "")).lower() != "subscription":
-            return {"handled": False, "event_type": etype, "reason": "non_subscription_mode"}
+            return _record_permanent("non_subscription_mode")
         if str(obj.get("payment_status", "")).lower() not in ("paid", "no_payment_required"):
-            return {"handled": False, "event_type": etype, "reason": "payment_not_completed"}
+            return _record_permanent("payment_not_completed")
         if str(obj.get("status", "complete")).lower() != "complete":
-            return {"handled": False, "event_type": etype, "reason": "session_incomplete"}
+            return _record_permanent("session_incomplete")
 
         meta = obj.get("metadata") or {}
         uid = meta.get("user_id") or obj.get("client_reference_id")
         user = store.get_user_by_id(str(uid)) if uid else None
         if user is None:
-            return {"handled": False, "event_type": etype, "reason": "user_not_found"}
+            return _record_permanent("user_not_found")
 
         if created_ts > 0 and created_ts < int(user.get("stripe_last_event_ts") or 0):
-            return {"handled": False, "event_type": etype, "reason": "stale_event"}
+            return _record_permanent("stale_event")
 
         cust_id = obj.get("customer")
         sub_id = obj.get("subscription")
+        sub_id_str = str(sub_id) if sub_id else None
 
+        if sub_id_str:
+            existing_sub = store.get_stripe_subscription_state(sub_id_str)
+            if (
+                existing_sub is not None
+                and str(existing_sub.get("status", "")).lower() == "canceled"
+            ):
+                return _record_permanent("subscription_already_canceled")
+
+        fetched_sub_status: str | None = None
         if pro_price_id:
             has_price = _subscription_has_price(obj, pro_price_id)
-            if has_price is None and sub_id and config and config.secret_key:
+            if has_price is None and sub_id_str and config and config.secret_key:
                 try:
                     sub_obj = fetch_stripe_subscription(
-                        config, str(sub_id), client=client
+                        config, sub_id_str, client=client
                     )
+                except TransientStripeError:
+                    raise
+                except httpx.HTTPStatusError as exc:
+                    status_code = exc.response.status_code
+                    if 400 <= status_code < 500 and status_code != 429:
+                        has_price = False
+                    else:
+                        raise TransientStripeError(
+                            f"Temporary Stripe subscription lookup error: {exc}"
+                        ) from exc
+                except Exception as exc:
+                    raise TransientStripeError(
+                        f"Temporary Stripe subscription lookup error: {exc}"
+                    ) from exc
+                else:
                     sub_status = str(sub_obj.get("status", "")).lower()
+                    fetched_sub_status = sub_status or None
                     if sub_status in ("active", "trialing"):
                         has_price = _subscription_has_price(sub_obj, pro_price_id)
                     else:
                         has_price = False
-                except Exception:
-                    has_price = False
             if has_price is not True:
-                return {
-                    "handled": False,
-                    "event_type": etype,
-                    "reason": "price_or_status_ineligible",
-                }
+                return _record_permanent("price_or_status_ineligible")
 
-        store.update_user_billing(
-            user["user_id"],
+        outcome = store.apply_stripe_event_entitlement(
+            event_id=event_id,
+            event_type=etype,
+            created_ts=created_ts,
+            user_id=user["user_id"],
             plan="pro",
             stripe_customer_id=str(cust_id) if cust_id else None,
-            stripe_subscription_id=str(sub_id) if sub_id else None,
-            last_event_ts=created_ts if created_ts > 0 else None,
+            stripe_subscription_id=sub_id_str,
+            sub_record_id=sub_id_str,
+            sub_status=fetched_sub_status or "active",
         )
+        if outcome == "duplicate":
+            return {
+                "handled": False,
+                "duplicate": True,
+                "event_type": etype,
+                "reason": "duplicate_event",
+            }
+        if outcome == "stale":
+            return {"handled": False, "event_type": etype, "reason": "stale_event"}
+        if outcome == "already_canceled":
+            return {
+                "handled": False,
+                "event_type": etype,
+                "reason": "subscription_already_canceled",
+            }
         return {
             "handled": True,
             "event_type": etype,
@@ -289,36 +354,64 @@ def handle_stripe_event(
     if etype == "customer.subscription.updated":
         cust_id = obj.get("customer")
         sub_id = obj.get("id")
+        sub_id_str = str(sub_id) if sub_id else None
         status = str(obj.get("status", "")).lower()
         user = store.get_user_by_stripe_customer(str(cust_id)) if cust_id else None
         if user is None:
-            return {"handled": False, "event_type": etype, "reason": "customer_not_found"}
+            return _record_permanent("customer_not_found")
         if created_ts > 0 and created_ts < int(user.get("stripe_last_event_ts") or 0):
-            return {"handled": False, "event_type": etype, "reason": "stale_event"}
+            return _record_permanent("stale_event")
         if pro_price_id and _subscription_has_price(obj, pro_price_id) is not True:
-            return {"handled": False, "event_type": etype, "reason": "price_mismatch"}
+            return _record_permanent("price_mismatch")
 
         current_sub = user.get("stripe_subscription_id")
         if (
             current_sub
-            and (not sub_id or str(sub_id) != current_sub)
+            and (not sub_id_str or sub_id_str != current_sub)
             and status not in ("active", "trialing")
         ):
-            return {"handled": False, "event_type": etype, "reason": "unrelated_subscription"}
+            return _record_permanent("unrelated_subscription")
 
         if status in ("active", "trialing"):
+            if sub_id_str:
+                existing_sub = store.get_stripe_subscription_state(sub_id_str)
+                if (
+                    existing_sub is not None
+                    and str(existing_sub.get("status", "")).lower() == "canceled"
+                ):
+                    return _record_permanent("subscription_already_canceled")
             new_plan = "pro"
         elif status in ("canceled", "unpaid", "past_due", "incomplete_expired"):
             new_plan = "free"
         else:
-            return {"handled": False, "event_type": etype, "reason": f"ignored_status:{status}"}
-        store.update_user_billing(
-            user["user_id"],
+            return _record_permanent(f"ignored_status:{status}")
+
+        outcome = store.apply_stripe_event_entitlement(
+            event_id=event_id,
+            event_type=etype,
+            created_ts=created_ts,
+            user_id=user["user_id"],
             plan=new_plan,
             stripe_customer_id=str(cust_id),
-            stripe_subscription_id=str(sub_id) if sub_id else None,
-            last_event_ts=created_ts if created_ts > 0 else None,
+            stripe_subscription_id=sub_id_str,
+            sub_record_id=sub_id_str,
+            sub_status=status,
         )
+        if outcome == "duplicate":
+            return {
+                "handled": False,
+                "duplicate": True,
+                "event_type": etype,
+                "reason": "duplicate_event",
+            }
+        if outcome == "stale":
+            return {"handled": False, "event_type": etype, "reason": "stale_event"}
+        if outcome == "already_canceled":
+            return {
+                "handled": False,
+                "event_type": etype,
+                "reason": "subscription_already_canceled",
+            }
         return {
             "handled": True,
             "event_type": etype,
@@ -329,23 +422,37 @@ def handle_stripe_event(
     if etype == "customer.subscription.deleted":
         cust_id = obj.get("customer")
         sub_id = obj.get("id")
+        sub_id_str = str(sub_id) if sub_id else None
         user = store.get_user_by_stripe_customer(str(cust_id)) if cust_id else None
         if user is None:
-            return {"handled": False, "event_type": etype, "reason": "customer_not_found"}
+            return _record_permanent("customer_not_found")
         if created_ts > 0 and created_ts < int(user.get("stripe_last_event_ts") or 0):
-            return {"handled": False, "event_type": etype, "reason": "stale_event"}
+            return _record_permanent("stale_event")
 
         current_sub = user.get("stripe_subscription_id")
-        if current_sub and (not sub_id or str(sub_id) != current_sub):
-            return {"handled": False, "event_type": etype, "reason": "unrelated_subscription"}
+        if current_sub and (not sub_id_str or sub_id_str != current_sub):
+            return _record_permanent("unrelated_subscription")
 
-        store.update_user_billing(
-            user["user_id"],
+        outcome = store.apply_stripe_event_entitlement(
+            event_id=event_id,
+            event_type=etype,
+            created_ts=created_ts,
+            user_id=user["user_id"],
             plan="free",
             stripe_customer_id=str(cust_id),
             stripe_subscription_id=None,
-            last_event_ts=created_ts if created_ts > 0 else None,
+            sub_record_id=sub_id_str,
+            sub_status="canceled",
         )
+        if outcome == "duplicate":
+            return {
+                "handled": False,
+                "duplicate": True,
+                "event_type": etype,
+                "reason": "duplicate_event",
+            }
+        if outcome == "stale":
+            return {"handled": False, "event_type": etype, "reason": "stale_event"}
         return {
             "handled": True,
             "event_type": etype,
@@ -353,4 +460,4 @@ def handle_stripe_event(
             "plan": "free",
         }
 
-    return {"handled": False, "event_type": etype, "reason": "unhandled_event_type"}
+    return _record_permanent("unhandled_event_type")

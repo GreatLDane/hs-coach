@@ -55,6 +55,7 @@ class AppConfig:
     public_url: str = "http://127.0.0.1:8000"
     allow_raw_log_upload: bool = True
     allow_hosted_guests: bool = False
+    allow_hosted_client_coaching: bool = False
     max_upload_bytes: int = 50 * 1024 * 1024
     max_replay_bytes: int = 2 * 1024 * 1024
     max_json_bytes: int = 64 * 1024
@@ -147,6 +148,7 @@ def load_app_config(
         public_url=public_url,
         allow_raw_log_upload=allow_raw_log_upload,
         allow_hosted_guests=_env_flag("HS_COACH_ALLOW_HOSTED_GUESTS"),
+        allow_hosted_client_coaching=_env_flag("HS_COACH_ALLOW_HOSTED_CLIENT_COACHING"),
         max_upload_bytes=_env_int("HS_COACH_MAX_UPLOAD_BYTES", 50 * 1024 * 1024),
         max_replay_bytes=_env_int("HS_COACH_MAX_REPLAY_BYTES", 2 * 1024 * 1024),
         max_json_bytes=_env_int("HS_COACH_MAX_JSON_BYTES", 64 * 1024),

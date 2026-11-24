@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+import re
+
 from jinja2 import Environment, select_autoescape
 
+from hs_coach.cards import clean_hs_display_text, partition_glossary
 from hs_coach.schemas import CoachReport, GameReplay
+
+
+def format_habit_tag(tag: str) -> str:
+    """Normalize snake_case, kebab-case, or mixed-case habit tags to Title Case."""
+    parts = [p for p in re.split(r"[\s_-]+", (tag or "").strip()) if p]
+    if not parts:
+        return tag or ""
+    return " ".join(p[:1].upper() + p[1:] for p in parts)
 
 _HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -317,7 +328,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
             <div>
               <a href="#turn-{{ tp.turn_number }}">Jump to Turn {{ tp.turn_number }}</a>
-              <span class="pill" style="margin-left: 6px;">{{ tp.habit_tag }}</span>
+              <span class="pill" style="margin-left: 6px;">{{ tp.habit_tag | format_habit_tag }}</span>
             </div>
           </div>
           <div class="tp-row"><span class="tp-label">Context:</span> {{ tp.turn_context }}</div>
@@ -352,7 +363,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
         {% for ht in report.habit_tags %}
         <div style="margin-bottom: 10px;">
           <span class="pill {{ 'good' if ht.polarity == 'strength' else 'mistake' }}">{{ ht.polarity }}</span>
-          <strong style="margin-left: 6px;"><code>{{ ht.tag }}</code></strong>
+          <strong style="margin-left: 6px;">{{ ht.tag | format_habit_tag }}</strong>
           {% if ht.turns %}
             <span style="color: var(--muted); font-size: 0.82rem;">(Turns: {{ ht.turns | join(", ") }})</span>
           {% endif %}
@@ -511,7 +522,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
           {% if t.actions %}
           <ol class="actions-list">
             {% for act in t.actions %}
-            <li>{{ act.summary }}{% if act.mana_cost is not none %} <span style="color: var(--muted);">({{ act.mana_cost }}m)</span>{% endif %}</li>
+            <li>{{ act.summary }}{% if act.action_type in ('PLAY', 'HERO_POWER') and act.mana_cost is not none %} <span style="color: var(--muted);">({{ act.mana_cost }}m)</span>{% endif %}</li>
             {% endfor %}
           </ol>
           {% else %}
@@ -539,7 +550,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 
     <section class="card">
       <details>
-        <summary>Card Glossary ({{ replay.cards_seen | length }} cards seen in match)</summary>
+        <summary>Card Glossary ({{ playable_glossary | length }} playable cards seen in match)</summary>
         <table style="margin-top: 12px;">
           <thead>
             <tr>
@@ -550,17 +561,40 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
             </tr>
           </thead>
           <tbody>
-            {% for ref in replay.cards_seen.values() | sort(attribute='name') %}
+            {% for ref in playable_glossary %}
             <tr>
               <td><strong>{{ ref.name }}</strong><br /><code>{{ ref.card_id }}</code></td>
               <td>{{ ref.base_cost if ref.base_cost is not none else '-' }}</td>
               <td>{{ ref.card_type }}{% if ref.spell_school %} · {{ ref.spell_school }}{% endif %}{% if ref.races %} · {{ ref.races | join('/') }}{% endif %}</td>
-              <td>{{ ref.text or '-' }}</td>
+              <td>{{ (ref.text | clean_card_text) or '-' }}</td>
             </tr>
             {% endfor %}
           </tbody>
         </table>
       </details>
+      {% if enchantment_glossary %}
+      <details style="margin-top: 12px;">
+        <summary>Enchantments &amp; Effects ({{ enchantment_glossary | length }})</summary>
+        <table style="margin-top: 12px;">
+          <thead>
+            <tr>
+              <th>Effect</th>
+              <th>Card ID</th>
+              <th>Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for ref in enchantment_glossary %}
+            <tr>
+              <td><strong>{{ ref.name }}</strong></td>
+              <td><code>{{ ref.card_id }}</code></td>
+              <td>{{ (ref.text | clean_card_text) or '-' }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </details>
+      {% endif %}
     </section>
   </div>
 </body>
@@ -568,6 +602,8 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 _ENV = Environment(autoescape=select_autoescape(default_for_string=True, default=True))
+_ENV.filters["format_habit_tag"] = format_habit_tag
+_ENV.filters["clean_card_text"] = clean_hs_display_text
 _COMPILED_TEMPLATE = _ENV.from_string(_HTML_TEMPLATE)
 
 
@@ -578,8 +614,11 @@ def render_html_report(
     tp_turns = (
         {tp.turn_number for tp in report.turning_points} if report is not None else set()
     )
+    playable_glossary, enchantment_glossary = partition_glossary(replay.cards_seen)
     return _COMPILED_TEMPLATE.render(
         replay=replay,
         report=report,
         turning_point_turns=tp_turns,
+        playable_glossary=playable_glossary,
+        enchantment_glossary=enchantment_glossary,
     )

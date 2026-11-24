@@ -43,6 +43,10 @@ def _sample_db() -> CardDB:
             {"id": "ASM_D2", "dbfId": 25, "name": "Bronze Keeper", "type": "MINION", "cost": 3, "attack": 2, "health": 5, "text": "<b>Taunt</b> & Draw a card."},
             {"id": "DG_001", "dbfId": 26, "name": "Waking Nightmare", "type": "SPELL", "cost": 0, "text": "+3 Attack and Lifesteal."},
             {"id": "ENCH_SP", "dbfId": 27, "name": "Kalec's Insight", "type": "ENCHANTMENT", "text": "Spell Damage +2"},
+            {"id": "RUSH_01", "dbfId": 28, "name": "Scion of Insight", "type": "MINION", "cost": 3, "attack": 3, "health": 3, "text": "<b>Rush</b>"},
+            {"id": "WEAP_TRIG", "dbfId": 29, "name": "Hammer of Archaedas", "type": "WEAPON", "cost": 4, "attack": 3, "durability": 2, "text": "After your hero attacks, cast Shadowflame Suffusion."},
+            {"id": "TRIG_SPELL", "dbfId": 30, "name": "Shadowflame Suffusion", "type": "SPELL", "cost": 2, "text": "Discover a Dragon."},
+            {"id": "AURA_ENCH", "dbfId": 31, "name": "Halls of Origination Aura", "type": "ENCHANTMENT", "text": "At end of turn, deal 8 split damage."},
         ]
     )
 
@@ -458,6 +462,144 @@ class TestParser(unittest.TestCase):
         self.assertEqual(rep.your_deck_observed[0].count, 2)
         self.assertEqual(len(rep.opponent_deck_observed), 1)
         self.assertEqual(rep.opponent_deck_observed[0].name, "River Crocolisk")
+
+    def test_timeline_polish_rush_dedup_triggers_owner_and_non_mana_costs(self) -> None:
+        log = "\n".join(
+            [
+                "D 14:00:00.0000000 GameState.DebugPrintPower() - CREATE_GAME",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() - GameEntity EntityID=1",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() - Player EntityID=2 PlayerID=1",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=FIRST_PLAYER value=1",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() - Player EntityID=3 PlayerID=2",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() - FULL_ENTITY - Creating ID=10 CardID=HERO_01",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CONTROLLER value=1",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=ZONE value=PLAY",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CARDTYPE value=HERO",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=HEALTH value=30",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() - FULL_ENTITY - Creating ID=11 CardID=CS2_102",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CONTROLLER value=1",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=ZONE value=PLAY",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CARDTYPE value=HERO_POWER",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=COST value=2",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() - FULL_ENTITY - Creating ID=12 CardID=HERO_08",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CONTROLLER value=2",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=ZONE value=PLAY",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CARDTYPE value=HERO",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=HEALTH value=30",
+                # Cards on board / hand
+                "D 14:00:00.0000000 GameState.DebugPrintPower() - FULL_ENTITY - Creating ID=40 CardID=LOC_001",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CONTROLLER value=1",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=ZONE value=PLAY",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CARDTYPE value=LOCATION",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=COST value=2",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=HEALTH value=2",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() - FULL_ENTITY - Creating ID=41 CardID=WEAP_TRIG",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CONTROLLER value=1",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=ZONE value=PLAY",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CARDTYPE value=WEAPON",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=COST value=4",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=ATK value=3",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=DURABILITY value=2",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() - FULL_ENTITY - Creating ID=42 CardID=RUSH_01",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CONTROLLER value=1",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=ZONE value=PLAY",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CARDTYPE value=MINION",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=COST value=3",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=ATK value=3",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=HEALTH value=3",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=RUSH value=1",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=EXHAUSTED value=1",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() - FULL_ENTITY - Creating ID=43 CardID=CS2_029",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CONTROLLER value=1",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=ZONE value=HAND",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CARDTYPE value=SPELL",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=COST value=4",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() - FULL_ENTITY - Creating ID=44 CardID=TRIG_SPELL",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CONTROLLER value=1",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=ZONE value=SETASIDE",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CARDTYPE value=SPELL",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() - FULL_ENTITY - Creating ID=45 CardID=AURA_ENCH",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CONTROLLER value=2",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=ZONE value=PLAY",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CARDTYPE value=ENCHANTMENT",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() - FULL_ENTITY - Creating ID=46 CardID=CS2_120",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CONTROLLER value=1",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=ZONE value=PLAY",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=CARDTYPE value=MINION",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=COST value=2",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=ATK value=2",
+                "D 14:00:00.0000000 GameState.DebugPrintPower() -     tag=HEALTH value=3",
+                "D 14:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_RANKED",
+                "D 14:00:00.0000000 GameState.DebugPrintGame() - FormatType=FT_STANDARD",
+                "D 14:00:00.0000000 GameState.DebugPrintGame() - PlayerID=1, PlayerName=LocalUser#1111",
+                "D 14:00:00.0000000 GameState.DebugPrintGame() - PlayerID=2, PlayerName=UNKNOWN HUMAN PLAYER",
+                # Turn 1 (Your turn): Play Fireball, Use Hero Power, Activate Location, Hero Attack -> Weapon trigger -> Spell trigger
+                "D 14:00:01.0000000 GameState.DebugPrintPower() - TAG_CHANGE Entity=GameEntity tag=TURN value=1",
+                "D 14:00:01.0000000 GameState.DebugPrintPower() - TAG_CHANGE Entity=2 tag=CURRENT_PLAYER value=1",
+                "D 14:00:01.0000000 GameState.DebugPrintPower() - TAG_CHANGE Entity=2 tag=RESOURCES value=10",
+                "D 14:00:01.0000000 GameState.DebugPrintPower() - TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY",
+                "D 14:00:01.0000000 GameState.DebugPrintPower() - TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_ACTION",
+                "D 14:00:02.0000000 GameState.DebugPrintPower() - BLOCK_START BlockType=PLAY Entity=[entityName=Fireball id=43 zone=HAND zonePos=1 cardId=CS2_029 player=1] EffectCardId=System.Collections.Generic.List`1[System.String] EffectIndex=0 Target=[entityName=Jaina Proudmoore id=12 zone=PLAY zonePos=0 cardId=HERO_08 player=2] SubOption=-1",
+                "D 14:00:02.0000000 GameState.DebugPrintPower() - BLOCK_END",
+                "D 14:00:02.1000000 GameState.DebugPrintPower() - BLOCK_START BlockType=PLAY Entity=[entityName=Armor Up! id=11 zone=PLAY zonePos=0 cardId=CS2_102 player=1] EffectCardId=System.Collections.Generic.List`1[System.String] EffectIndex=0 Target=0 SubOption=-1",
+                "D 14:00:02.1000000 GameState.DebugPrintPower() - BLOCK_END",
+                "D 14:00:02.2000000 GameState.DebugPrintPower() - BLOCK_START BlockType=PLAY Entity=[entityName=Cosmic Springs id=40 zone=PLAY zonePos=1 cardId=LOC_001 player=1] EffectCardId=System.Collections.Generic.List`1[System.String] EffectIndex=0 Target=0 SubOption=-1",
+                "D 14:00:02.2000000 GameState.DebugPrintPower() - BLOCK_END",
+                "D 14:00:02.3000000 GameState.DebugPrintPower() - BLOCK_START BlockType=ATTACK Entity=[entityName=River Crocolisk id=46 zone=PLAY zonePos=2 cardId=CS2_120 player=1] EffectCardId=System.Collections.Generic.List`1[System.String] EffectIndex=0 Target=[entityName=Jaina Proudmoore id=12 zone=PLAY zonePos=0 cardId=HERO_08 player=2] SubOption=-1",
+                "D 14:00:02.3000000 GameState.DebugPrintPower() - BLOCK_START BlockType=TRIGGER Entity=[entityName=Hammer of Archaedas id=41 zone=PLAY zonePos=0 cardId=WEAP_TRIG player=1] EffectCardId=System.Collections.Generic.List`1[System.String] EffectIndex=0 Target=0 SubOption=-1",
+                "D 14:00:02.3000000 GameState.DebugPrintPower() - BLOCK_START BlockType=TRIGGER Entity=[entityName=Shadowflame Suffusion id=44 zone=SETASIDE zonePos=0 cardId=TRIG_SPELL player=1] EffectCardId=System.Collections.Generic.List`1[System.String] EffectIndex=0 Target=0 SubOption=-1",
+                "D 14:00:02.3000000 GameState.DebugPrintPower() - BLOCK_END",
+                "D 14:00:02.3000000 GameState.DebugPrintPower() - BLOCK_END",
+                "D 14:00:02.3000000 GameState.DebugPrintPower() - BLOCK_END",
+                "D 14:00:03.0000000 GameState.DebugPrintPower() - TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_END",
+                "D 14:00:03.0000000 GameState.DebugPrintPower() - TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_NEXT",
+                # Turn 2 (Opponent's turn): Out-of-turn Deathrattle attack by YOUR minion + End-of-Turn Aura proc
+                "D 14:00:04.0000000 GameState.DebugPrintPower() - TAG_CHANGE Entity=GameEntity tag=TURN value=2",
+                "D 14:00:04.0000000 GameState.DebugPrintPower() - TAG_CHANGE Entity=2 tag=CURRENT_PLAYER value=0",
+                "D 14:00:04.0000000 GameState.DebugPrintPower() - TAG_CHANGE Entity=3 tag=CURRENT_PLAYER value=1",
+                "D 14:00:04.0000000 GameState.DebugPrintPower() - TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY",
+                "D 14:00:04.0000000 GameState.DebugPrintPower() - TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_ACTION",
+                "D 14:00:05.0000000 GameState.DebugPrintPower() - BLOCK_START BlockType=DEATHS Entity=GameEntity EffectCardId=System.Collections.Generic.List`1[System.String] EffectIndex=0 Target=0 SubOption=-1",
+                "D 14:00:05.0000000 GameState.DebugPrintPower() - BLOCK_START BlockType=ATTACK Entity=[entityName=River Crocolisk id=46 zone=PLAY zonePos=2 cardId=CS2_120 player=1] EffectCardId=System.Collections.Generic.List`1[System.String] EffectIndex=0 Target=[entityName=Jaina Proudmoore id=12 zone=PLAY zonePos=0 cardId=HERO_08 player=2] SubOption=-1",
+                "D 14:00:05.0000000 GameState.DebugPrintPower() - BLOCK_END",
+                "D 14:00:05.0000000 GameState.DebugPrintPower() - BLOCK_END",
+                "D 14:00:06.0000000 GameState.DebugPrintPower() - TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_END",
+                "D 14:00:06.1000000 GameState.DebugPrintPower() - BLOCK_START BlockType=TRIGGER Entity=[entityName=Halls of Origination Aura id=45 zone=PLAY zonePos=0 cardId=AURA_ENCH player=2] EffectCardId=System.Collections.Generic.List`1[System.String] EffectIndex=0 Target=0 SubOption=-1 TriggerKeyword=END_OF_TURN",
+                "D 14:00:06.1000000 GameState.DebugPrintPower() - BLOCK_END",
+                "D 14:00:07.0000000 GameState.DebugPrintPower() - TAG_CHANGE Entity=2 tag=PLAYSTATE value=WON",
+                "D 14:00:07.0000000 GameState.DebugPrintPower() - TAG_CHANGE Entity=3 tag=PLAYSTATE value=LOST",
+            ]
+        )
+        p = _write_temp_log(log)
+        try:
+            res = parse_power_log(p, _sample_db(), standard_only=True)
+        finally:
+            p.unlink(missing_ok=True)
+
+        self.assertEqual(len(res.replays), 1)
+        rep = res.replays[0]
+        t1, t2 = rep.turns[0], rep.turns[1]
+
+        # Rush minion summoned this turn has exactly one collapsed Rush badge
+        rush_ent = next(e for e in t1.start_state.your_board if e.card_id == "RUSH_01")
+        self.assertEqual(rush_ent.keywords, ["Rush (minions only)"])
+
+        # Only PLAY and HERO_POWER keep mana_cost; ACTIVATE, ATTACK, and TRIGGER omit mana_cost
+        self.assertEqual([a.action_type for a in t1.actions], ["PLAY", "HERO_POWER", "ACTIVATE", "ATTACK", "TRIGGER", "TRIGGER"])
+        self.assertEqual(t1.actions[0].mana_cost, 4)
+        self.assertEqual(t1.actions[1].mana_cost, 2)
+        for idx in (2, 3, 4, 5):
+            self.assertIsNone(t1.actions[idx].mana_cost)
+
+        self.assertIn("Triggers Hammer of Archaedas", t1.actions[4].summary)
+        self.assertIn("Triggered cast: Shadowflame Suffusion", t1.actions[5].summary)
+
+        # Out-of-turn Deathrattle attack carries [Your Deathrattle] prefix + Aura EOT proc logged
+        self.assertEqual(len(t2.actions), 2)
+        self.assertTrue(t2.actions[0].summary.startswith("[Your Deathrattle] Attacks with River Crocolisk"))
+        self.assertIsNone(t2.actions[0].mana_cost)
+        self.assertIn("Triggers Halls of Origination Aura", t2.actions[1].summary)
+        self.assertIsNone(t2.actions[1].mana_cost)
 
 
 if __name__ == "__main__":

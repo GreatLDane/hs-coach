@@ -97,7 +97,7 @@ Test every critical flow yourself before sharing publicly:
    - Refresh the dashboard -> confirm the match appears with BattleTags stripped (`you` vs `opponent`), click **Coach**, watch it transition `Queued...` -> `Coaching...`, and open **View Report**.
 4. **Stripe Checkout E2E (Test mode):**
    - Click **Upgrade to Pro** -> complete checkout using Stripe's test card (`4242 4242 4242 4242`, any future expiry, any 3-digit CVC).
-   - Return to HS-Coach -> verify your account badge now says **PRO (200/month)** and **Manage Billing** opens Stripe's Customer Portal.
+   - Return to HS-Coach -> verify your account badge now says **PRO · 0/200 coached this month · 0/30 deep** and **Manage Billing** opens Stripe's Customer Portal.
 5. **Switch Stripe to Live Mode:**
    - Once Test mode works end-to-end, toggle **Test mode OFF** in Stripe, recreate the `HS-Coach Pro` product + webhook endpoint (`https://YOUR_RENDER_URL/api/billing/webhook`), and update `STRIPE_SECRET_KEY` (`sk_live_...`), `STRIPE_WEBHOOK_SECRET`, and `STRIPE_PRO_PRICE_ID` in Render.
 

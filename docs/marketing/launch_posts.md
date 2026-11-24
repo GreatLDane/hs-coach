@@ -38,7 +38,7 @@ Here's one full report so you can judge the quality yourself (no account needed)
 - A small Windows uploader reads your local `Power.log` after each game, **removes player names and BattleTags on your PC**, and sends only the anonymized replay. The raw log never leaves your machine.
 - Before any AI sees the game, plain code works out the exact numbers: lethal checks (Taunt, Divine Shield, Immune, Secrets), floated mana and unused attacks. The AI then explains turning points and mulligans from those numbers. It can still be wrong, and I want to know when it is.
 
-Disclosure: I made it. Free tier is 5 coached games a month. Pro is $9/month for 200 with stronger models. [APP_URL]
+Disclosure: I made it. Free tier is 5 coached games a month. Pro is $9/month for 200, including 30 deep reviews with stronger models. [APP_URL]
 
 Limits: Windows only, Standard only, and the uploader isn't code-signed yet (SmartScreen will warn you; there's a sha256 on the release page).
 
@@ -95,7 +95,7 @@ Keep it short. Post only in `#self-promo` / `#tools`, or wherever mods say.
 > Windows uploader: [RELEASE_URL]
 
 **3/3**
-> Free: 5 coached games/month. Pro: $9 for 200.
+> Free: 5 coached games/month. Pro: $9 for 200 (30 of them deep reviews).
 > [APP_URL]
 > Send me a game it got wrong and I'll dig into it.
 

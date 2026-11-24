@@ -74,4 +74,4 @@ You can either export environment variables or place them in a local gitignored 
 ## SaaS Accounts & Freemium Quotas
 - **Guest Trial (`local`)**: Drag-and-drop `Power.log` trial without registering.
 - **Free Plan**: `5` coached games / month using `google/gemini-3.7-flash` plus a personal `hs-coach watch` upload token.
-- **Pro Plan**: `200` coached games / month across all models (`google/gemini-3.1-pro-preview`, `anthropic/claude-sonnet-4.5`, etc.).
+- **Pro Plan**: `200` coached games / month on the fast model (`google/gemini-3.7-flash`), including `30` deep reviews / month with stronger models (`google/gemini-3.1-pro-preview`, `anthropic/claude-sonnet-4.5`). Set by `PlanConfig.monthly_deep_limit` in `auth.py`.

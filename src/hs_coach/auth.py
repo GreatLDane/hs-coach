@@ -19,6 +19,16 @@ SESSION_TTL_SECONDS = 30 * 24 * 3600  # 30 days
 PASSWORD_RESET_TTL_SECONDS = 900  # 15 minutes
 _PBKDF2_ITERS = 200_000
 
+FAST_MODEL = "google/gemini-3.7-flash"
+# Models that count as cheap "fast" reviews; every other model is a metered "deep review".
+FAST_MODELS: frozenset[str] = frozenset({FAST_MODEL})
+
+
+def is_deep_model(model: str | None) -> bool:
+    """True when coaching with this model consumes a monthly deep-review slot."""
+    return bool(model) and model not in FAST_MODELS
+
+
 DEFAULT_PRO_MODELS: frozenset[str] = frozenset(
     {
         "google/gemini-3.7-flash",
@@ -36,6 +46,8 @@ class PlanConfig:
     monthly_coach_limit: int
     allowed_models: frozenset[str]
     default_model: str
+    # Monthly cap on coaching runs with non-fast ("deep") models. Counted inside monthly_coach_limit.
+    monthly_deep_limit: int = 0
 
 
 PLAN_CONFIGS: dict[str, PlanConfig] = {
@@ -55,7 +67,8 @@ PLAN_CONFIGS: dict[str, PlanConfig] = {
         name="pro",
         monthly_coach_limit=200,
         allowed_models=DEFAULT_PRO_MODELS,
-        default_model="google/gemini-3.1-pro-preview",
+        default_model=FAST_MODEL,
+        monthly_deep_limit=30,
     ),
 }
 

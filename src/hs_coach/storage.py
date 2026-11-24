@@ -679,6 +679,45 @@ class GameStore:
         game_cnt = int(game_row["cnt"]) if game_row else 0
         return max(res_cnt, game_cnt)
 
+    def _count_deep_locked(
+        self, user_id: str, month_key: str, fast_models: frozenset[str]
+    ) -> int:
+        """Count this month's deep (non-fast model) coaching runs. Caller must hold self._lock."""
+        fast = sorted(fast_models) or [""]
+        marks = ",".join("?" for _ in fast)
+        res_row = self._conn.execute(
+            f"""
+            SELECT COUNT(*) AS cnt
+            FROM coach_reservations
+            WHERE user_id = ?
+              AND month_key = ?
+              AND status IN ('reserved', 'completed')
+              AND model NOT IN ({marks})
+            """,
+            (user_id, month_key, *fast),
+        ).fetchone()
+        game_row = self._conn.execute(
+            f"""
+            SELECT COUNT(*) AS cnt
+            FROM games
+            WHERE user_id = ?
+              AND coach_json IS NOT NULL
+              AND coached_at LIKE ?
+              AND model IS NOT NULL
+              AND model NOT IN ({marks})
+            """,
+            (user_id, f"{month_key}%", *fast),
+        ).fetchone()
+        return max(
+            int(res_row["cnt"]) if res_row else 0,
+            int(game_row["cnt"]) if game_row else 0,
+        )
+
+    def count_deep_this_month(self, user_id: str, fast_models: frozenset[str]) -> int:
+        month_key = datetime.now(timezone.utc).strftime("%Y-%m")
+        with self._lock:
+            return self._count_deep_locked(user_id, month_key, fast_models)
+
     def reserve_coaching_slot(
         self,
         user_id: str,
@@ -686,8 +725,14 @@ class GameStore:
         *,
         monthly_limit: int,
         model: str,
+        deep_limit: int | None = None,
+        fast_models: frozenset[str] = frozenset(),
     ) -> tuple[str | None, str | None]:
-        """Atomically reserve one coaching slot inside BEGIN IMMEDIATE; returns (res_id, error_code)."""
+        """Atomically reserve one coaching slot inside BEGIN IMMEDIATE; returns (res_id, error_code).
+
+        When deep_limit is set and `model` is not in fast_models, the run also needs a free
+        monthly deep-review slot; otherwise returns "deep_quota_exceeded".
+        """
         month_key = datetime.now(timezone.utc).strftime("%Y-%m")
         now_iso = datetime.now(timezone.utc).isoformat()
         reservation_id = uuid.uuid4().hex[:16]
@@ -733,6 +778,12 @@ class GameStore:
                 if used >= monthly_limit:
                     self._conn.rollback()
                     return None, "quota_exceeded"
+
+                if deep_limit is not None and model not in fast_models:
+                    deep_used = self._count_deep_locked(user_id, month_key, fast_models)
+                    if deep_used >= deep_limit:
+                        self._conn.rollback()
+                        return None, "deep_quota_exceeded"
 
                 self._conn.execute(
                     """

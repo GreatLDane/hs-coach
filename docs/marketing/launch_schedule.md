@@ -52,7 +52,7 @@ Keep answers short, factual and calm. Never claim Blizzard approval.
 > Not yet: Standard Constructed on Windows only. Tell me which one you want most.
 
 **"Why pay $9?"**
-> You don't have to: 5 coached games a month are free. Pro is for people grinding many games who want 200 reviews a month and stronger models. Cancel any time from Manage Billing.
+> You don't have to: 5 coached games a month are free. Pro is for people grinding many games who want 200 reviews a month, including 30 deep reviews with stronger models (Gemini 3.1 Pro / Claude Sonnet). Cancel any time from Manage Billing.
 
 **"Is it live / does it tell me what to play?"**
 > No. It never runs during a game. It only reviews games after they've ended.

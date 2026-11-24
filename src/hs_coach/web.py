@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from hs_coach.auth import (
     GUEST_COOKIE_NAME,
     PASSWORD_RESET_TTL_SECONDS,
+    FAST_MODELS,
     PLAN_CONFIGS,
     SESSION_COOKIE_NAME,
     SESSION_TTL_SECONDS,
@@ -167,7 +168,7 @@ _TERMS_HTML = _legal_page_html(
     <h2>2. Plans, Quotas &amp; Subscriptions</h2>
     <ul>
       <li><strong>Free:</strong> 5 coached games per month at no cost.</li>
-      <li><strong>Pro:</strong> $9.00 USD per month for 200 coached games per month and stronger models. Payments are processed by Stripe. Pro renews automatically each month until you cancel.</li>
+      <li><strong>Pro:</strong> $9.00 USD per month for 200 coached games per month, including 30 deep reviews per month with stronger models. Payments are processed by Stripe. Pro renews automatically each month until you cancel.</li>
       <li>Automated abuse, quota circumvention, or excessive traffic is subject to rate limiting or account suspension.</li>
     </ul>
     <h2>3. Cancellation &amp; Refunds</h2>
@@ -365,7 +366,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="grid-2" style="grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));">
         <div><strong>1. Strip Names Locally</strong><div class="muted">Play Standard Constructed. When the game ends, the Windows uploader removes names and BattleTags before anything leaves your PC.</div></div>
         <div><strong>2. Deterministic Math</strong><div class="muted">Exact Python checks find missed lethals, floated mana, burned cards and unused attacks first, so the AI review is grounded in real numbers.</div></div>
-        <div><strong>3. Grounded AI Review</strong><div class="muted"><strong>Free:</strong> 5 coached games/mo (Flash) + upload token · <strong>Pro:</strong> $9/month for 200/mo across Gemini Pro, Sonnet, and GPT-4.1. Cancel anytime.</div></div>
+        <div><strong>3. Grounded AI Review</strong><div class="muted"><strong>Free:</strong> 5 coached games/mo (Flash) + upload token · <strong>Pro:</strong> $9/month for 200 games/mo, including 30 deep reviews with stronger models (Gemini 3.1 Pro, Claude Sonnet). Cancel anytime.</div></div>
       </div>
     </section>
 
@@ -407,10 +408,9 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         <label class="muted">
           Coaching Model:
           <select id="modelSelect">
-            <option value="">Plan Default</option>
-            <option value="google/gemini-3.7-flash">google/gemini-3.7-flash (Free &amp; Pro · Fast)</option>
-            <option value="google/gemini-3.1-pro-preview">google/gemini-3.1-pro-preview (Pro · Deep)</option>
-            <option value="anthropic/claude-sonnet-4.5">anthropic/claude-sonnet-4.5 (Pro · Sonnet)</option>
+            <option value="">Fast (default)</option>
+            <option value="google/gemini-3.1-pro-preview">Deep review · Gemini 3.1 Pro (Pro, uses 1 of 30/mo)</option>
+            <option value="anthropic/claude-sonnet-4.5">Deep review · Claude Sonnet 4.5 (Pro, uses 1 of 30/mo)</option>
           </select>
         </label>
         <button id="uploadBtn" class="primary" type="button">Choose Power.log</button>
@@ -534,7 +534,8 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         const u = data.user;
         const q = data.quota;
         info.appendChild(el("strong", u.email));
-        const badge = el("span", `${u.plan.toUpperCase()} · ${q.used_this_month}/${q.monthly_limit} coached this month`, "pill plan");
+        const deepPart = q.deep_limit ? ` · ${q.deep_used}/${q.deep_limit} deep` : "";
+        const badge = el("span", `${u.plan.toUpperCase()} · ${q.used_this_month}/${q.monthly_limit} coached this month${deepPart}`, "pill plan");
         badge.style.marginLeft = "10px";
         info.appendChild(badge);
 
@@ -970,11 +971,19 @@ def _public_user(user: dict[str, Any]) -> dict[str, Any]:
 def _quota_info(store: GameStore, user: dict[str, Any]) -> dict[str, Any]:
     cfg = PLAN_CONFIGS.get(user["plan"], PLAN_CONFIGS["free"])
     used = store.count_coached_this_month(user["user_id"])
+    deep_used = (
+        store.count_deep_this_month(user["user_id"], FAST_MODELS)
+        if cfg.monthly_deep_limit
+        else 0
+    )
     return {
         "plan": cfg.name,
         "used_this_month": used,
         "monthly_limit": cfg.monthly_coach_limit,
         "remaining": max(0, cfg.monthly_coach_limit - used),
+        "deep_used": deep_used,
+        "deep_limit": cfg.monthly_deep_limit,
+        "deep_remaining": max(0, cfg.monthly_deep_limit - deep_used),
         "allowed_models": sorted(get_plan_allowed_models(cfg.name)),
         "default_model": cfg.default_model,
     }
@@ -1156,6 +1165,8 @@ def create_app(
             game_id,
             monthly_limit=plan_cfg.monthly_coach_limit,
             model=model_name,
+            deep_limit=plan_cfg.monthly_deep_limit if plan_cfg.monthly_deep_limit else None,
+            fast_models=FAST_MODELS,
         )
         if err_code == "in_flight":
             raise HTTPException(
@@ -1168,6 +1179,14 @@ def create_app(
                 detail=(
                     f"Monthly {plan_cfg.name} coaching quota reached "
                     f"({plan_cfg.monthly_coach_limit}). Upgrade to Pro for higher limits."
+                ),
+            )
+        if err_code == "deep_quota_exceeded":
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    f"You've used all {plan_cfg.monthly_deep_limit} deep reviews this month. "
+                    "Choose Fast in Coaching Model to keep coaching; deep reviews reset next month."
                 ),
             )
         return res_id

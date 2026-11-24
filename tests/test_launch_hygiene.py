@@ -65,6 +65,19 @@ class TestLaunchHygiene(unittest.TestCase):
             self.assertIn("Terms of Service", terms.text)
             self.assertIn("Blizzard Entertainment", terms.text)
 
+    def test_dashboard_onboarding_links_uploader_and_avoids_overclaims(self) -> None:
+        app = create_app(CardDB(), self.store, config=_hosted_cfg())
+        with TestClient(app) as client:
+            html = client.get("/").text
+            self.assertIn('id="uploaderDownload"', html)
+            self.assertIn("https://github.com/GreatLDane/hs-coach/releases/latest", html)
+            self.assertIn('rel="noopener noreferrer"', html)
+            self.assertIn("Windows protected your PC", html)
+            self.assertIn(".sha256", html)
+            lowered = html.lower()
+            for banned in ("zero hallucinations", "overlay", "live advice", "deck tracker"):
+                self.assertNotIn(banned, lowered, banned)
+
     def test_password_reset_lifecycle_non_enumeration_and_session_revocation(self) -> None:
         app = create_app(CardDB(), self.store, config=_hosted_cfg())
         sent_emails: list[tuple[str, str]] = []

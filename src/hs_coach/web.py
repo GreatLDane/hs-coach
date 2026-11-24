@@ -329,18 +329,34 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <section class="card topbar">
       <div>
         <h1>HS-Coach · Post-Game Standard AI Coach</h1>
-        <div class="muted">Upload a Hearthstone <code>Power.log</code> or sync automatically with <code>hs-coach watch</code>.</div>
+        <div class="muted">Review your finished Standard games: mulligans, turning points and missed lethals, after the match is over.</div>
       </div>
       <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center;">
-        <span class="pill privacy">100% Post-Game · BattleTags Stripped · Raw Log Deleted After Parse</span>
+        <span class="pill privacy">100% Post-Game · Names &amp; BattleTags Stripped On Your PC</span>
+      </div>
+    </section>
+
+    <section id="uploaderCard" class="card">
+      <h2>Get the Windows Uploader</h2>
+      <div class="muted" style="margin-bottom: 10px;">
+        After each finished game, <code>HS-Coach-Uploader.exe</code> reads your local <code>Power.log</code>, strips player names and BattleTags on your PC, and uploads only the anonymized replay. Raw logs never leave your machine.
+      </div>
+      <a id="uploaderDownload" class="btn-link" href="https://github.com/GreatLDane/hs-coach/releases/latest" target="_blank" rel="noopener noreferrer">Download HS-Coach-Uploader.exe (Windows)</a>
+      <ol class="muted" style="margin: 10px 0 0 18px; padding: 0; font-size: 0.88rem;">
+        <li>Register free below and click <strong>Copy Upload Token</strong>.</li>
+        <li>Open the uploader, paste the token, click <strong>Enable Power.log</strong>, then <strong>Save Settings</strong>. Restart Hearthstone if it was open.</li>
+        <li>Play a Standard game to the end. It appears here; click <strong>Coach</strong>.</li>
+      </ol>
+      <div class="muted" style="margin-top: 8px; font-size: 0.8rem;">
+        The uploader is not code-signed yet, so Windows may show "Windows protected your PC": click More info &rarr; Run anyway. Each release lists a <code>.sha256</code> checksum you can verify first.
       </div>
     </section>
 
     <section id="onboardingCard" class="card">
       <h2>How HS-Coach Works · Free vs Pro</h2>
       <div class="grid-2" style="grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));">
-        <div><strong>1. Parse Locally</strong><div class="muted">Play Standard Constructed, then let the Windows uploader or CLI strip BattleTags before anything leaves your PC.</div></div>
-        <div><strong>2. Deterministic Math</strong><div class="muted">Exact Python checks catch missed lethals, mana floated, burned cards, and unused attacks — zero hallucinations.</div></div>
+        <div><strong>1. Strip Names Locally</strong><div class="muted">Play Standard Constructed. When the game ends, the Windows uploader removes names and BattleTags before anything leaves your PC.</div></div>
+        <div><strong>2. Deterministic Math</strong><div class="muted">Exact Python checks find missed lethals, floated mana, burned cards and unused attacks first, so the AI review is grounded in real numbers.</div></div>
         <div><strong>3. Grounded AI Review</strong><div class="muted"><strong>Free:</strong> 5 coached games/mo (Flash) + upload token · <strong>Pro:</strong> 200/mo across Gemini Pro, Sonnet, and GPT-4.1.</div></div>
       </div>
     </section>
@@ -364,9 +380,10 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         <button id="confirmResetBtn" class="primary" type="button">Update Password</button>
       </div>
       <div id="watcherBox" class="muted" style="margin-top: 10px; display: none;">
-        Auto-uploader command: <code id="watchCmd"></code>
+        Upload token for HS-Coach-Uploader.exe:
         <button id="copyTokenBtn" type="button" class="primary" style="margin-left: 8px; padding: 4px 9px; font-size: 0.8rem;">Copy Upload Token</button>
         <button id="rotateTokenBtn" type="button" style="margin-left: 8px; padding: 4px 9px; font-size: 0.8rem;">Rotate Token</button>
+        <div style="margin-top: 6px; font-size: 0.8rem;">Advanced (CLI instead of the .exe): <code id="watchCmd"></code></div>
       </div>
       <div id="authStatus" class="status-msg" style="margin-top: 6px;"></div>
     </section>
@@ -488,9 +505,9 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         fileInput.accept = ".log,.txt";
         uploadBtn.textContent = "Choose Power.log";
       } else {
-        uploadHeading.textContent = "Import Anonymized Replay JSON";
-        dropTitle.textContent = "Drag & drop anonymized .replay.json here, or sync via hs-coach watch";
-        dropSub.textContent = "Hosted mode keeps raw Power.log files on-device. Only BattleTag-free replays are accepted.";
+        uploadHeading.textContent = "Manual Import (Advanced)";
+        dropTitle.textContent = "Most players don't need this: the Windows uploader sends finished games automatically.";
+        dropSub.textContent = "Advanced: drop an anonymized .replay.json made by the hs-coach CLI. Raw Power.log files are never accepted here.";
         fileInput.accept = ".json";
         uploadBtn.textContent = "Choose .replay.json";
       }
@@ -724,7 +741,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         const tr = document.createElement("tr");
         const td = el("td", rawUploadEnabled
           ? "No games uploaded yet. Drag a Power.log above to begin."
-          : "No games imported yet. Drag an anonymized .replay.json above or run hs-coach watch.", "muted");
+          : "No games yet. Run the Windows uploader with your upload token, then finish a Standard game.", "muted");
         td.colSpan = 7;
         tr.appendChild(td);
         tbody.appendChild(tr);

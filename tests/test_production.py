@@ -265,7 +265,14 @@ class TestProductionReadiness(unittest.TestCase):
 
                     running_poll = client_a.get(f"/api/jobs/{job_id}")
                     self.assertEqual(running_poll.status_code, 200)
-                    self.assertEqual(running_poll.json()["status"], "running")
+                    running_data = running_poll.json()
+                    self.assertEqual(running_data["status"], "running")
+                    self.assertEqual(running_data.get("poll_url"), f"/api/jobs/{job_id}")
+
+                    home_html = client_a.get("/").text
+                    self.assertIn("const pollUrl = data.poll_url;", home_html)
+                    self.assertIn("await fetch(pollUrl)", home_html)
+                    self.assertNotIn("fetch(data.poll_url)", home_html)
 
                     release_evt.set()
 

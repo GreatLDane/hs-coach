@@ -638,6 +638,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         });
         let data = await res.json();
         if (res.status === 202 && data.poll_url) {
+          const pollUrl = data.poll_url;
           setStatus(`Coaching job queued for ${gameId}...`);
           while (true) {
             if (data.status === "queued") btn.textContent = "Queued...";
@@ -650,7 +651,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
               throw new Error(data.error || "Coaching failed");
             }
             await new Promise((resolve) => setTimeout(resolve, 1500));
-            const pollRes = await fetch(data.poll_url);
+            const pollRes = await fetch(pollUrl);
             data = await pollRes.json();
             if (!pollRes.ok) {
               throw new Error(data.detail || "Failed to poll coaching job");
@@ -1682,6 +1683,7 @@ def create_app(
         job = app.state.job_manager.get(job_id, actor_id)
         if job is None:
             raise HTTPException(status_code=404, detail="Coaching job not found")
+        job["poll_url"] = f"/api/jobs/{job_id}"
         return job
 
     @app.get("/api/habits")

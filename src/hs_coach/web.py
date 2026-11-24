@@ -38,13 +38,14 @@ from hs_coach.auth import (
     verify_session_token_details,
 )
 from hs_coach.billing import (
+    TransientStripeError,
     create_billing_portal_session,
     create_checkout_session,
     handle_stripe_event,
     resolve_stripe_config,
     verify_stripe_signature,
 )
-from hs_coach.cards import CardDB
+from hs_coach.cards import CardDB, canonicalize_replay
 from hs_coach.coach import coach_game, resolve_coach_config
 from hs_coach.config import AppConfig, is_loopback_host, load_app_config
 from hs_coach.parser import parse_power_log
@@ -62,6 +63,10 @@ from hs_coach.security import (
 from hs_coach.storage import GameStore
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB limit
+_HOSTED_UNTRUSTED_COACH_MSG = (
+    "Hosted coaching is disabled for unverified client-submitted replays. "
+    "Trusted post-game completion evidence is required; use local mode for self-parsed Power.log coaching."
+)
 
 
 class CoachRequest(BaseModel):
@@ -743,9 +748,16 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
           const tdAct = document.createElement("td");
           tdAct.style.display = "flex";
           tdAct.style.gap = "8px";
-          const btn = el("button", g.coached ? "Re-Coach" : "Coach", g.coached ? "" : "primary");
+          const untrustedHosted = !rawUploadEnabled && g.completion_trusted === false;
+          const btnLabel = g.coached ? "Re-Coach" : (untrustedHosted ? "Unverified" : "Coach");
+          const btn = el("button", btnLabel, (g.coached || untrustedHosted) ? "" : "primary");
           btn.type = "button";
-          btn.addEventListener("click", () => coachGame(g.game_id, btn));
+          if (untrustedHosted) {
+            btn.disabled = true;
+            btn.title = "Hosted coaching requires trusted post-game completion evidence. Use local mode for self-parsed Power.log coaching.";
+          } else {
+            btn.addEventListener("click", () => coachGame(g.game_id, btn));
+          }
           tdAct.appendChild(btn);
 
           const link = el("a", "View Report", "btn-link");
@@ -869,6 +881,8 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "Password update failed");
         setAuthStatus(data.message);
+        if (tokEl) tokEl.value = "";
+        if (pwEl) pwEl.value = "";
         const box = document.getElementById("resetBox");
         if (box) box.style.display = "none";
       } catch (err) {
@@ -876,13 +890,18 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       }
     });
 
-    const urlParams = new URLSearchParams(window.location.search);
-    const resetTokParam = urlParams.get("reset_token");
+    const hashParams = new URLSearchParams((window.location.hash || "").replace(/^#/, ""));
+    const resetTokParam = hashParams.get("reset_token");
     if (resetTokParam) {
       const box = document.getElementById("resetBox");
       const tokEl = document.getElementById("resetToken");
       if (box) box.style.display = "flex";
       if (tokEl) tokEl.value = resetTokParam;
+      if (window.history && window.history.replaceState) {
+        window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      } else {
+        window.location.hash = "";
+      }
     }
 
     async function refreshAll() {
@@ -1234,7 +1253,7 @@ def create_app(
             exp = int(time.time()) + PASSWORD_RESET_TTL_SECONDS
             app.state.store.create_password_reset(user["user_id"], tok_hash, exp)
             base_url = (cfg.public_url or str(request.base_url)).rstrip("/")
-            reset_url = f"{base_url}/?reset_token={raw_tok}"
+            reset_url = f"{base_url}/#reset_token={raw_tok}"
             try:
                 send_password_reset_email(user["email"], reset_url)
             except Exception:
@@ -1374,7 +1393,12 @@ def create_app(
             event = json.loads(raw_body.decode("utf-8"))
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Invalid webhook JSON.") from exc
-        return handle_stripe_event(event, app.state.store, config=stripe_cfg)
+        try:
+            return handle_stripe_event(event, app.state.store, config=stripe_cfg)
+        except TransientStripeError as exc:
+            raise HTTPException(
+                status_code=503, detail="Temporary Stripe error; please retry."
+            ) from exc
 
     # ---- Replay ingestion & upload ----
 
@@ -1433,11 +1457,14 @@ def create_app(
 
         try:
             validate_completed_replay(replay)
+            replay = canonicalize_replay(replay, app.state.card_db)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         gid = replay.metadata.game_id
-        is_new = app.state.store.upsert_replay(replay, user_id=target_user_id)
+        is_new = app.state.store.upsert_replay(
+            replay, user_id=target_user_id, completion_trusted=False
+        )
         loaded = app.state.store.get_game(gid, user_id=target_user_id)
         existing_report = loaded[1] if loaded else None
         coached = existing_report is not None
@@ -1445,28 +1472,33 @@ def create_app(
         coach_error: str | None = None
 
         if auto_coach and not coached:
-            res_id: str | None = None
-            try:
-                coach_cfg = _validate_policy_and_config(plan_name, model, provider)
-                res_id = _reserve_for_actor(
-                    target_user_id, plan_name, gid, coach_cfg.model
-                )
-                report = coach_game(replay, coach_cfg)
-                app.state.store.save_coach_report(
-                    gid, report, user_id=target_user_id
-                )
-                if res_id is not None:
-                    app.state.store.complete_coaching_reservation(res_id)
-                coached = True
-                grade = report.overall_grade
-            except HTTPException as exc:
-                if res_id is not None:
-                    app.state.store.release_coaching_reservation(res_id)
-                coach_error = str(exc.detail)
-            except Exception as exc:
-                if res_id is not None:
-                    app.state.store.release_coaching_reservation(res_id)
-                coach_error = str(exc)
+            if cfg.mode == "hosted" and not app.state.store.is_completion_trusted(
+                gid, user_id=target_user_id
+            ):
+                coach_error = _HOSTED_UNTRUSTED_COACH_MSG
+            else:
+                res_id: str | None = None
+                try:
+                    coach_cfg = _validate_policy_and_config(plan_name, model, provider)
+                    res_id = _reserve_for_actor(
+                        target_user_id, plan_name, gid, coach_cfg.model
+                    )
+                    report = coach_game(replay, coach_cfg)
+                    app.state.store.save_coach_report(
+                        gid, report, user_id=target_user_id
+                    )
+                    if res_id is not None:
+                        app.state.store.complete_coaching_reservation(res_id)
+                    coached = True
+                    grade = report.overall_grade
+                except HTTPException as exc:
+                    if res_id is not None:
+                        app.state.store.release_coaching_reservation(res_id)
+                    coach_error = str(exc.detail)
+                except Exception as exc:
+                    if res_id is not None:
+                        app.state.store.release_coaching_reservation(res_id)
+                    coach_error = str(exc)
 
         out: dict[str, Any] = {
             "game_id": gid,
@@ -1529,7 +1561,9 @@ def create_app(
         duplicate_games = 0
         game_ids: list[str] = []
         for replay in parsed.replays:
-            is_new = app.state.store.upsert_replay(replay, user_id=user_id)
+            is_new = app.state.store.upsert_replay(
+                replay, user_id=user_id, completion_trusted=True
+            )
             if is_new:
                 new_games += 1
             else:
@@ -1595,6 +1629,15 @@ def create_app(
         if loaded is None:
             raise HTTPException(status_code=404, detail="Game not found")
         replay, _ = loaded
+        if cfg.mode == "hosted" and not app.state.store.is_completion_trusted(
+            game_id, user_id=actor_id
+        ):
+            raise HTTPException(status_code=403, detail=_HOSTED_UNTRUSTED_COACH_MSG)
+
+        try:
+            replay = canonicalize_replay(replay, app.state.card_db)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         req_model = req.model if req else None
         req_provider = req.provider if req else None
